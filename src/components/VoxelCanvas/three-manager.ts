@@ -236,6 +236,18 @@ export class ThreeManager {
   private isAutomaticallyMovingCamera: boolean = false;
 
   private updateChunkVisibility(): void {
+    // Always ensure all chunks are visible - culling disabled for stability
+    this.chunks.forEach((chunk) => {
+      Object.values(chunk.instancedMeshes).forEach(instancedMesh => {
+        instancedMesh.visible = true;
+      });
+    });
+    
+    // Skip culling logic entirely to prevent current position disappearing
+    return;
+    
+    // Original culling logic kept but disabled
+    /*
     if (!this.cullingEnabled) {
       // If culling is disabled, ensure all chunks are visible
       this.chunks.forEach((chunk) => {
@@ -266,13 +278,16 @@ export class ThreeManager {
         new THREE.Vector3(chunkCenterX, chunkCenterY, chunkCenterZ)
       );
       
-      const isVisible = distanceToChunk <= this.cullingDistance;
+      // Never cull chunk containing current position
+      const hasCurrentPosition = this.currentPositionKey && chunk.voxelInstances.has(this.currentPositionKey);
+      const isVisible = hasCurrentPosition || distanceToChunk <= this.cullingDistance;
       
       // Update visibility for all InstancedMesh objects in this chunk
       Object.values(chunk.instancedMeshes).forEach(instancedMesh => {
         instancedMesh.visible = isVisible;
       });
     });
+    */
   }
 
   private cleanupEmptyChunks(): void {

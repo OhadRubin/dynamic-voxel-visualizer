@@ -7,9 +7,9 @@ import ControlsPanel from './components/UI/ControlsPanel';
 import './App.css';
 
 function App() {
-  // Culling state
+  // Culling state  
   const [cullingEnabled, setCullingEnabled] = useState(false);
-  const [cullingDistance, setCullingDistance] = useState(100);
+  const [cullingDistance, setCullingDistance] = useState(1000);
 
   // Camera state
   const [cameraSettings, setCameraSettings] = useState({ following: true, userControlled: false });
