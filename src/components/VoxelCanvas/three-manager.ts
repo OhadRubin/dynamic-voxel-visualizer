@@ -14,6 +14,12 @@ export class ThreeManager {
   private currentPositionVoxel: THREE.Mesh | null = null;
   private currentTargetVoxel: THREE.Mesh | null = null;
   private animationId: number | null = null;
+  
+  // Camera following variables
+  private cameraFollowTarget: THREE.Vector3 = new THREE.Vector3();
+  private isFollowingEnabled: boolean = true;
+  private followLerpFactor: number = 0.05;
+  private cameraOffset: THREE.Vector3 = new THREE.Vector3(30, 30, 30);
 
   constructor(canvas: HTMLCanvasElement) {
     // Initialize Three.js objects
@@ -76,13 +82,6 @@ export class ThreeManager {
     const axesHelper = new THREE.AxesHelper(50);
     this.scene.add(axesHelper);
     
-    // Add a test cube at origin
-    const testGeometry = new THREE.BoxGeometry(2, 2, 2);
-    const testMaterial = new THREE.MeshBasicMaterial({ color: 0xff00ff });
-    const testCube = new THREE.Mesh(testGeometry, testMaterial);
-    testCube.position.set(0, 1, 0);
-    this.scene.add(testCube);
-    console.log('Test cube added at origin (0, 1, 0) in magenta - if you see this, rendering works!');
   }
 
   private setupControls(): void {
@@ -126,6 +125,23 @@ export class ThreeManager {
   private startRenderLoop(): void {
     const animate = () => {
       this.animationId = requestAnimationFrame(animate);
+      
+      // Smooth camera following logic
+      if (this.isFollowingEnabled && this.currentPositionVoxel) {
+        // Calculate desired camera position (target + offset)
+        const desiredPosition = new THREE.Vector3().copy(this.cameraFollowTarget).add(this.cameraOffset);
+        
+        // Calculate delta for smooth interpolation
+        const delta = new THREE.Vector3().subVectors(desiredPosition, this.camera.position).multiplyScalar(this.followLerpFactor);
+        
+        // Update camera position
+        this.camera.position.add(delta);
+        
+        // Update controls target to look at the current position
+        const targetDelta = new THREE.Vector3().subVectors(this.cameraFollowTarget, this.controls.target).multiplyScalar(this.followLerpFactor);
+        this.controls.target.add(targetDelta);
+      }
+      
       this.controls.update();
       this.renderer.render(this.scene, this.camera);
     };
@@ -178,6 +194,11 @@ export class ThreeManager {
             prevMaterial.transparent = true;
           }
           this.currentPositionVoxel = voxel;
+          
+          // Update camera follow target
+          if (this.isFollowingEnabled) {
+            this.cameraFollowTarget.set(voxelData.x, voxelData.y, voxelData.z);
+          }
         }
         
         if (voxelData.state === 'CURRENT_TARGET') {
