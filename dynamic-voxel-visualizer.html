@@ -251,6 +251,9 @@
                 this.startTime = Date.now();
                 this.recentVoxels = [];
                 
+                // Origin offset - first voxel becomes 0,0,0
+                this.originOffset = null;
+                
                 // Materials for different voxel states
                 this.materials = {
                     WALKABLE: new THREE.MeshBasicMaterial({ 
@@ -433,11 +436,23 @@
                 if (state !== "WALKABLE" && state !== "CURRENT_POSITION" && state !== "CURRENT_TARGET"){
                     return;
                 }
-                const key = `${x},${y},${z}`;
+                
+                // Set origin offset from the first voxel received
+                if (this.originOffset === null) {
+                    this.originOffset = { x: x, y: y, z: z };
+                    console.log('Setting origin offset to:', this.originOffset);
+                }
+                
+                // Apply offset so first voxel is at 0,0,0
+                const offsetX = x - this.originOffset.x;
+                const offsetY = y - this.originOffset.y;
+                const offsetZ = z - this.originOffset.z;
+                
+                const key = `${offsetX},${offsetY},${offsetZ}`;
                 
                 // Debug first few voxels
                 if (this.voxelCount < 10 || this.voxelCount % 1000 === 0) {
-                    console.log(`Voxel ${this.voxelCount}: x=${x}, y=${y}, z=${z}, state=${state}`);
+                    console.log(`Voxel ${this.voxelCount}: x=${offsetX}, y=${offsetY}, z=${offsetZ}, state=${state} (original: ${x},${y},${z})`);
                 }
                 
                 // Special handling for CURRENT_POSITION voxels
@@ -468,7 +483,7 @@
                 // Create new voxel
                 const material = (this.materials[state] || this.materials.DEFAULT).clone();
                 const voxel = new THREE.Mesh(this.voxelGeometry, material);
-                voxel.position.set(x, y, z);
+                voxel.position.set(offsetX, offsetY, offsetZ);
                 
                 // Add edges for better visibility
                 const edges = new THREE.EdgesGeometry(this.voxelGeometry);
@@ -547,19 +562,19 @@
                 }
                 
                 // Update bounds
-                this.bounds.min.x = Math.min(this.bounds.min.x, x);
-                this.bounds.min.y = Math.min(this.bounds.min.y, y);
-                this.bounds.min.z = Math.min(this.bounds.min.z, z);
-                this.bounds.max.x = Math.max(this.bounds.max.x, x);
-                this.bounds.max.y = Math.max(this.bounds.max.y, y);
-                this.bounds.max.z = Math.max(this.bounds.max.z, z);
+                this.bounds.min.x = Math.min(this.bounds.min.x, offsetX);
+                this.bounds.min.y = Math.min(this.bounds.min.y, offsetY);
+                this.bounds.min.z = Math.min(this.bounds.min.z, offsetZ);
+                this.bounds.max.x = Math.max(this.bounds.max.x, offsetX);
+                this.bounds.max.y = Math.max(this.bounds.max.y, offsetY);
+                this.bounds.max.z = Math.max(this.bounds.max.z, offsetZ);
                 
-                // Auto-center camera on first voxel
+                // Auto-center camera on first voxel (which is now at origin)
                 if (this.voxelCount === 1) {
-                    console.log('Centering camera on first voxel at:', x, y, z);
-                    this.controls.target.set(x, y, z);
-                    this.camera.position.set(x + 30, y + 30, z + 30);
-                    this.camera.lookAt(x, y, z);
+                    console.log('Centering camera on first voxel at:', offsetX, offsetY, offsetZ);
+                    this.controls.target.set(offsetX, offsetY, offsetZ);
+                    this.camera.position.set(offsetX + 30, offsetY + 30, offsetZ + 30);
+                    this.camera.lookAt(offsetX, offsetY, offsetZ);
                     this.controls.update();
                 }
                 
@@ -623,6 +638,7 @@
                     this.recentVoxels = [];
                     this.currentPositionVoxel = null;
                     this.currentTargetVoxel = null;
+                    this.originOffset = null; // Reset origin offset
                     this.bounds = {
                         min: { x: Infinity, y: Infinity, z: Infinity },
                         max: { x: -Infinity, y: -Infinity, z: -Infinity }

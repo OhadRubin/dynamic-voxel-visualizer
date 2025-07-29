@@ -93,10 +93,35 @@ export class ThreeManager {
     this.controls.minDistance = 5;
     this.controls.maxDistance = 200;
     this.controls.enableRotate = true;
+    this.controls.enablePan = true;
+    this.controls.enableZoom = true;
+
+    // Add double-click listener directly to controls' dom element
+    this.renderer.domElement.addEventListener('dblclick', this.handleDoubleClick.bind(this));
 
     // Window resize handler
     window.addEventListener('resize', this.onWindowResize.bind(this));
   }
+
+  private handleDoubleClick = (event: MouseEvent) => {
+    // Raycasting to find clicked voxel
+    const mouse = new THREE.Vector2();
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+    mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+    const raycaster = new THREE.Raycaster();
+    raycaster.setFromCamera(mouse, this.camera);
+
+    const intersects = raycaster.intersectObjects(this.voxelGroup.children);
+
+    if (intersects.length > 0) {
+      const target = intersects[0].object.position;
+      this.controls.target.copy(target);
+      this.controls.update();
+      console.log('Focused on voxel at:', target);
+    }
+  };
 
   private startRenderLoop(): void {
     const animate = () => {
@@ -243,27 +268,6 @@ export class ThreeManager {
     this.controls.update();
   }
 
-  public onDoubleClick(event: MouseEvent, callback?: (position: THREE.Vector3) => void): void {
-    // Raycasting to find clicked voxel
-    const mouse = new THREE.Vector2();
-    mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
-    mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
-
-    const raycaster = new THREE.Raycaster();
-    raycaster.setFromCamera(mouse, this.camera);
-
-    const intersects = raycaster.intersectObjects(this.voxelGroup.children);
-
-    if (intersects.length > 0) {
-      const target = intersects[0].object.position;
-      this.controls.target.copy(target);
-      this.controls.update();
-      
-      if (callback) {
-        callback(target);
-      }
-    }
-  }
 
   private onWindowResize(): void {
     this.camera.aspect = window.innerWidth / window.innerHeight;
@@ -276,6 +280,10 @@ export class ThreeManager {
     if (this.animationId) {
       cancelAnimationFrame(this.animationId);
     }
+
+    // Remove event listeners
+    this.renderer.domElement.removeEventListener('dblclick', this.handleDoubleClick.bind(this));
+    window.removeEventListener('resize', this.onWindowResize.bind(this));
 
     // Dispose of all voxel meshes
     this.voxels.forEach(mesh => {
@@ -295,13 +303,10 @@ export class ThreeManager {
     // Dispose of geometry
     this.voxelGeometry.dispose();
 
-    // Dispose of renderer
-    this.renderer.dispose();
-
-    // Remove event listeners
-    window.removeEventListener('resize', this.onWindowResize.bind(this));
-
     // Dispose of controls
     this.controls.dispose();
+
+    // Dispose of renderer
+    this.renderer.dispose();
   }
 }

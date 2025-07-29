@@ -17,10 +17,6 @@ function App() {
     centerCamera
   } = useVoxelStream('ws://localhost:8080');
 
-  const handleVoxelDoubleClick = (position: THREE.Vector3) => {
-    console.log('Double-clicked voxel at:', position);
-  };
-
   return (
     <div style={{ 
       margin: 0, 
@@ -37,7 +33,6 @@ function App() {
         voxels={voxels}
         centerRequest={centerRequest}
         bounds={stats.bounds}
-        onVoxelDoubleClick={handleVoxelDoubleClick}
       />
       
       {/* UI Panels */}

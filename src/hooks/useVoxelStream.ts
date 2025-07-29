@@ -40,6 +40,7 @@ export const useVoxelStream = (websocketUrl: string) => {
   const recentVoxels = useRef<number[]>([]);
   const voxelCount = useRef(0);
   const reconnectTimeout = useRef<NodeJS.Timeout | null>(null);
+  const originOffset = useRef<{ x: number; y: number; z: number } | null>(null);
 
   const connectWebSocket = useCallback(() => {
     if (websocket.current?.readyState === WebSocket.OPEN) {
@@ -68,17 +69,24 @@ export const useVoxelStream = (websocketUrl: string) => {
           const data = JSON.parse(event.data);
           
           if (data.type === 'voxel') {
-            const voxelData: VoxelData = {
-              x: data.x,
-              y: data.y,
-              z: data.z,
-              state: data.state
-            };
-
             // Only show certain voxel types
-            if (!['WALKABLE', 'CURRENT_POSITION', 'CURRENT_TARGET'].includes(voxelData.state)) {
+            if (!['WALKABLE', 'CURRENT_POSITION', 'CURRENT_TARGET'].includes(data.state)) {
               return;
             }
+
+            // Set origin offset from the first voxel received
+            if (originOffset.current === null) {
+              originOffset.current = { x: data.x, y: data.y, z: data.z };
+              console.log('Setting origin offset to:', originOffset.current);
+            }
+
+            // Apply offset so first voxel is at 0,0,0
+            const voxelData: VoxelData = {
+              x: data.x - originOffset.current.x,
+              y: data.y - originOffset.current.y,
+              z: data.z - originOffset.current.z,
+              state: data.state
+            };
 
             const key = `${voxelData.x},${voxelData.y},${voxelData.z}`;
 
@@ -152,9 +160,81 @@ export const useVoxelStream = (websocketUrl: string) => {
     }
   }, [websocketUrl, isPaused]);
 
-  // Initialize WebSocket connection
+  // Initialize WebSocket connection and add test data
   useEffect(() => {
     connectWebSocket();
+
+    // Add some test voxels if no WebSocket connection after 2 seconds
+    const testDataTimeout = setTimeout(() => {
+      if (!websocket.current || websocket.current.readyState !== WebSocket.OPEN) {
+        console.log('Adding test voxel data since WebSocket is not connected');
+        
+        // Add test voxels to demonstrate the system
+        const testVoxelData = [
+          { x: 100, y: 50, z: 200, state: 'WALKABLE' },
+          { x: 101, y: 50, z: 200, state: 'WALKABLE' },
+          { x: 102, y: 50, z: 200, state: 'CURRENT_POSITION' },
+          { x: 100, y: 51, z: 200, state: 'WALKABLE' },
+          { x: 101, y: 51, z: 200, state: 'CURRENT_TARGET' },
+          { x: 102, y: 51, z: 200, state: 'WALKABLE' },
+        ];
+
+        testVoxelData.forEach((data, index) => {
+          setTimeout(() => {
+            // Simulate WebSocket message processing
+            if (!['WALKABLE', 'CURRENT_POSITION', 'CURRENT_TARGET'].includes(data.state)) {
+              return;
+            }
+
+            // Set origin offset from the first voxel
+            if (originOffset.current === null) {
+              originOffset.current = { x: data.x, y: data.y, z: data.z };
+              console.log('Setting origin offset to:', originOffset.current);
+            }
+
+            // Apply offset so first voxel is at 0,0,0
+            const voxelData: VoxelData = {
+              x: data.x - originOffset.current.x,
+              y: data.y - originOffset.current.y,
+              z: data.z - originOffset.current.z,
+              state: data.state as VoxelState
+            };
+
+            const key = `${voxelData.x},${voxelData.y},${voxelData.z}`;
+
+            setVoxels(prev => {
+              const newVoxels = new Map(prev);
+              newVoxels.set(key, voxelData);
+              return newVoxels;
+            });
+
+            uniquePositions.current.add(key);
+            voxelCount.current++;
+
+            // Update bounds
+            setStats(prev => ({
+              ...prev,
+              voxelCount: voxelCount.current,
+              uniqueCount: uniquePositions.current.size,
+              bounds: {
+                min: {
+                  x: Math.min(prev.bounds.min.x, voxelData.x),
+                  y: Math.min(prev.bounds.min.y, voxelData.y),
+                  z: Math.min(prev.bounds.min.z, voxelData.z)
+                },
+                max: {
+                  x: Math.max(prev.bounds.max.x, voxelData.x),
+                  y: Math.max(prev.bounds.max.y, voxelData.y),
+                  z: Math.max(prev.bounds.max.z, voxelData.z)
+                }
+              }
+            }));
+
+            console.log(`Test voxel ${voxelCount.current}: x=${voxelData.x}, y=${voxelData.y}, z=${voxelData.z}, state=${voxelData.state}`);
+          }, index * 500); // Add each voxel with 500ms delay
+        });
+      }
+    }, 2000);
 
     return () => {
       if (websocket.current) {
@@ -163,6 +243,7 @@ export const useVoxelStream = (websocketUrl: string) => {
       if (reconnectTimeout.current) {
         clearTimeout(reconnectTimeout.current);
       }
+      clearTimeout(testDataTimeout);
     };
   }, [connectWebSocket]);
 
@@ -187,6 +268,7 @@ export const useVoxelStream = (websocketUrl: string) => {
     uniquePositions.current.clear();
     recentVoxels.current = [];
     voxelCount.current = 0;
+    originOffset.current = null; // Reset origin offset
     
     setStats(prev => ({
       ...prev,
