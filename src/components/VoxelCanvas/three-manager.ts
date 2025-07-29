@@ -215,6 +215,7 @@ export class ThreeManager {
       this.camera.position.copy(desiredPosition);
       this.controls.target.copy(targetPosition);
       this.controls.update();
+      this.requestRender();
     }
   }
 
@@ -234,6 +235,168 @@ export class ThreeManager {
   }
 
   private isAutomaticallyMovingCamera: boolean = false;
+  
+  // Render-on-demand variables
+  private needsRender: boolean = true;
+  private isUserInteracting: boolean = false;
+
+  // Batch processing variables
+  private voxelUpdateQueue: Array<{key: string, voxelData: VoxelData | null}> = [];
+  private queuedKeys = new Set<string>(); // Track queued keys for deduplication
+  private isProcessingBatch: boolean = false;
+  private readonly BATCH_SIZE = 300; // Process up to 300 voxels per frame
+  private readonly FRAME_BUDGET_MS = 14; // Max 14ms per frame for voxel processing
+  private readonly MAX_QUEUE_SIZE = 2000; // Drop old voxels if queue exceeds this
+  private readonly SPATIAL_CULL_DISTANCE = 150; // Only process voxels within this distance
+
+  private requestRender(): void {
+    this.needsRender = true;
+  }
+
+  private shouldCullVoxel(voxelData: VoxelData): boolean {
+    // Never cull critical voxels
+    if (voxelData.state === 'CURRENT_POSITION' || voxelData.state === 'CURRENT_TARGET') {
+      return false;
+    }
+
+    // Calculate distance from camera
+    const distance = this.camera.position.distanceTo(
+      new THREE.Vector3(voxelData.x, voxelData.y, voxelData.z)
+    );
+    
+    return distance > this.SPATIAL_CULL_DISTANCE;
+  }
+
+  private addToQueue(key: string, voxelData: VoxelData | null): void {
+    // Skip if already queued (deduplication)
+    if (this.queuedKeys.has(key)) {
+      // Update existing entry by finding and replacing it
+      const existingIndex = this.voxelUpdateQueue.findIndex(item => item.key === key);
+      if (existingIndex !== -1) {
+        this.voxelUpdateQueue[existingIndex] = { key, voxelData };
+      }
+      return;
+    }
+
+    // Check queue size limit
+    if (this.voxelUpdateQueue.length >= this.MAX_QUEUE_SIZE) {
+      // Remove oldest items to make space
+      const toRemove = this.voxelUpdateQueue.splice(0, 100); // Remove 100 oldest
+      toRemove.forEach(item => this.queuedKeys.delete(item.key));
+    }
+
+    this.voxelUpdateQueue.push({ key, voxelData });
+    this.queuedKeys.add(key);
+  }
+
+  private processBatchedVoxelUpdates(): void {
+    if (this.voxelUpdateQueue.length === 0 || this.isProcessingBatch) {
+      return;
+    }
+
+    this.isProcessingBatch = true;
+    const startTime = performance.now();
+    let processedCount = 0;
+    let totalProcessed = 0;
+
+    // Process multiple batches if time allows
+    while ((performance.now() - startTime) < this.FRAME_BUDGET_MS) {
+      processedCount = 0;
+      
+      // Process regular queue
+      while (
+        this.voxelUpdateQueue.length > 0 &&
+        processedCount < this.BATCH_SIZE &&
+        (performance.now() - startTime) < this.FRAME_BUDGET_MS
+      ) {
+        const update = this.voxelUpdateQueue.shift()!;
+        this.queuedKeys.delete(update.key); // Remove from deduplication set
+        this.processVoxelUpdate(update.key, update.voxelData);
+        processedCount++;
+        totalProcessed++;
+      }
+
+      // If we didn't process anything this iteration, break
+      if (processedCount === 0) {
+        break;
+      }
+    }
+
+    // If we processed any voxels, request a render and cleanup empty chunks
+    if (totalProcessed > 0) {
+      this.cleanupEmptyChunks();
+      this.requestRender();
+    }
+
+    // If there are still items in queue, continue processing next frame
+    if (this.voxelUpdateQueue.length > 0) {
+      this.requestRender();
+    }
+
+    this.isProcessingBatch = false;
+  }
+
+  private processVoxelUpdate(key: string, voxelData: VoxelData | null): void {
+    if (voxelData === null) {
+      // This is a removal operation
+      this.chunks.forEach((chunk) => {
+        const existingInstance = chunk.voxelInstances.get(key);
+        if (existingInstance) {
+          this.releaseInstanceIndex(chunk, existingInstance.state, existingInstance.instanceIndex);
+          chunk.voxelInstances.delete(key);
+        }
+      });
+      return;
+    }
+
+    // This is an add/update operation
+    const chunkCoords = this.getChunkCoords(voxelData.x, voxelData.y, voxelData.z);
+    const chunk = this.getOrCreateChunk(chunkCoords);
+    
+    const existingInstance = chunk.voxelInstances.get(key);
+    
+    if (existingInstance) {
+      // Check if state changed
+      if (existingInstance.state !== voxelData.state) {
+        // Release old instance and create new one with different state
+        this.releaseInstanceIndex(chunk, existingInstance.state, existingInstance.instanceIndex);
+        
+        const newInstanceIndex = this.getAvailableInstanceIndex(chunk, voxelData.state);
+        this.setInstanceTransform(chunk, voxelData.state, newInstanceIndex, voxelData.x, voxelData.y, voxelData.z);
+        
+        chunk.voxelInstances.set(key, {
+          state: voxelData.state,
+          instanceIndex: newInstanceIndex
+        });
+      } else {
+        // Just update position (in case it moved)
+        this.setInstanceTransform(chunk, voxelData.state, existingInstance.instanceIndex, voxelData.x, voxelData.y, voxelData.z);
+      }
+    } else {
+      // Create new voxel instance
+      const instanceIndex = this.getAvailableInstanceIndex(chunk, voxelData.state);
+      this.setInstanceTransform(chunk, voxelData.state, instanceIndex, voxelData.x, voxelData.y, voxelData.z);
+      
+      chunk.voxelInstances.set(key, {
+        state: voxelData.state,
+        instanceIndex
+      });
+    }
+
+    // Handle special voxel types
+    if (voxelData.state === 'CURRENT_POSITION') {
+      this.currentPositionKey = key;
+      
+      // Update camera follow target
+      if (this.isFollowingEnabled) {
+        this.cameraFollowTarget.set(voxelData.x, voxelData.y, voxelData.z);
+      }
+    }
+    
+    if (voxelData.state === 'CURRENT_TARGET') {
+      this.currentTargetKey = key;
+    }
+  }
 
   private updateChunkVisibility(): void {
     // Always ensure all chunks are visible - culling disabled for stability
@@ -355,6 +518,20 @@ export class ThreeManager {
     this.controls.enablePan = true;
     this.controls.enableZoom = true;
 
+    // Add event listeners for render-on-demand
+    this.controls.addEventListener('start', () => {
+      this.isUserInteracting = true;
+      this.requestRender();
+    });
+    
+    this.controls.addEventListener('change', () => {
+      this.requestRender();
+    });
+    
+    this.controls.addEventListener('end', () => {
+      this.isUserInteracting = false;
+    });
+
     // Add double-click listener directly to controls' dom element
     this.renderer.domElement.addEventListener('dblclick', this.handleDoubleClick.bind(this));
 
@@ -385,6 +562,7 @@ export class ThreeManager {
         
         this.controls.target.copy(position);
         this.controls.update();
+        this.requestRender();
         console.log('Focused on voxel at:', position);
       }
     }
@@ -394,6 +572,8 @@ export class ThreeManager {
   private startRenderLoop(): void {
     const animate = () => {
       this.animationId = requestAnimationFrame(animate);
+      
+      let shouldRender = this.needsRender;
       
       // Detect if user is manually controlling the camera
       this.detectUserCameraControl();
@@ -408,12 +588,17 @@ export class ThreeManager {
         // Calculate delta for smooth interpolation
         const delta = new THREE.Vector3().subVectors(desiredPosition, this.camera.position).multiplyScalar(this.followLerpFactor);
         
-        // Update camera position
-        this.camera.position.add(delta);
-        
-        // Update controls target to look at the current position
-        const targetDelta = new THREE.Vector3().subVectors(this.cameraFollowTarget, this.controls.target).multiplyScalar(this.followLerpFactor);
-        this.controls.target.add(targetDelta);
+        // Only continue following if there's significant movement
+        if (delta.length() > 0.001) {
+          // Update camera position
+          this.camera.position.add(delta);
+          
+          // Update controls target to look at the current position
+          const targetDelta = new THREE.Vector3().subVectors(this.cameraFollowTarget, this.controls.target).multiplyScalar(this.followLerpFactor);
+          this.controls.target.add(targetDelta);
+          
+          shouldRender = true;
+        }
         
         this.isAutomaticallyMovingCamera = false;
       } else if (this.isFollowingEnabled && this.currentPositionKey && this.userControlledCamera) {
@@ -426,119 +611,83 @@ export class ThreeManager {
         
         // Smoothly move target to follow the current position
         const targetDelta = new THREE.Vector3().subVectors(this.cameraFollowTarget, this.controls.target).multiplyScalar(this.followLerpFactor);
-        this.controls.target.add(targetDelta);
         
-        // Move camera to maintain the same relative offset
-        this.camera.position.copy(this.controls.target).add(currentOffset);
+        // Only update if there's significant movement
+        if (targetDelta.length() > 0.001) {
+          this.controls.target.add(targetDelta);
+          
+          // Move camera to maintain the same relative offset
+          this.camera.position.copy(this.controls.target).add(currentOffset);
+          
+          shouldRender = true;
+        }
         
         this.isAutomaticallyMovingCamera = false;
       }
       
+      // Process batched voxel updates
+      this.processBatchedVoxelUpdates();
+      
       // Update chunk visibility based on culling settings
       this.updateChunkVisibility();
       
-      this.controls.update();
-      this.renderer.render(this.scene, this.camera);
+      // Only render if something changed
+      if (shouldRender || this.isUserInteracting) {
+        this.controls.update();
+        this.renderer.render(this.scene, this.camera);
+        this.needsRender = false;
+      }
     };
     animate();
   }
 
   public updateVoxels(voxelsMap: Map<string, VoxelData>): void {
-    // Track chunks that need updating for cleanup
-    const updatedChunks = new Set<string>();
-    
-    // Remove voxels that are no longer in the new data
-    const keysToRemove: string[] = [];
-    this.chunks.forEach((chunk, chunkKey) => {
-      chunk.voxelInstances.forEach(({ state, instanceIndex }, key) => {
-        if (!voxelsMap.has(key)) {
-          // Release the instance index
-          this.releaseInstanceIndex(chunk, state, instanceIndex);
-          keysToRemove.push(key);
-          updatedChunks.add(chunkKey);
-        }
-      });
-    });
-    
-    // Remove keys from their respective chunks
-    keysToRemove.forEach(key => {
-      // Find which chunk this key belongs to
-      this.chunks.forEach((chunk) => {
-        if (chunk.voxelInstances.has(key)) {
-          chunk.voxelInstances.delete(key);
-        }
+    // Find voxels to remove (not in new data)
+    const currentKeys = new Set<string>();
+    this.chunks.forEach((chunk) => {
+      chunk.voxelInstances.forEach((_, key) => {
+        currentKeys.add(key);
       });
     });
 
-    // Add or update voxels
+    // Queue removals for voxels not in the new data
+    currentKeys.forEach(key => {
+      if (!voxelsMap.has(key)) {
+        this.addToQueue(key, null);
+      }
+    });
+
+    // Process voxels with immediate handling for critical ones
     voxelsMap.forEach((voxelData, key) => {
-      const chunkCoords = this.getChunkCoords(voxelData.x, voxelData.y, voxelData.z);
-      const chunk = this.getOrCreateChunk(chunkCoords);
-      const chunkKey = this.getChunkKey(...chunkCoords);
-      updatedChunks.add(chunkKey);
-      
-      const existingInstance = chunk.voxelInstances.get(key);
-      
-      if (existingInstance) {
-        // Check if state changed
-        if (existingInstance.state !== voxelData.state) {
-          // Release old instance and create new one with different state
-          this.releaseInstanceIndex(chunk, existingInstance.state, existingInstance.instanceIndex);
-          
-          const newInstanceIndex = this.getAvailableInstanceIndex(chunk, voxelData.state);
-          this.setInstanceTransform(chunk, voxelData.state, newInstanceIndex, voxelData.x, voxelData.y, voxelData.z);
-          
-          chunk.voxelInstances.set(key, {
-            state: voxelData.state,
-            instanceIndex: newInstanceIndex
-          });
-        } else {
-          // Just update position (in case it moved)
-          this.setInstanceTransform(chunk, voxelData.state, existingInstance.instanceIndex, voxelData.x, voxelData.y, voxelData.z);
-        }
-      } else {
-        // Create new voxel instance
-        const instanceIndex = this.getAvailableInstanceIndex(chunk, voxelData.state);
-        this.setInstanceTransform(chunk, voxelData.state, instanceIndex, voxelData.x, voxelData.y, voxelData.z);
-        
-        chunk.voxelInstances.set(key, {
-          state: voxelData.state,
-          instanceIndex
-        });
+      // Process CURRENT_POSITION and CURRENT_TARGET immediately for responsiveness
+      if (voxelData.state === 'CURRENT_POSITION' || voxelData.state === 'CURRENT_TARGET') {
+        this.processVoxelUpdate(key, voxelData);
+        this.requestRender();
+        return;
       }
 
-      // Handle special voxel types
-      if (voxelData.state === 'CURRENT_POSITION') {
-        this.currentPositionKey = key;
-        
-        // Update camera follow target
-        if (this.isFollowingEnabled) {
-          this.cameraFollowTarget.set(voxelData.x, voxelData.y, voxelData.z);
-        }
+      // Apply spatial culling for regular voxels
+      if (this.shouldCullVoxel(voxelData)) {
+        return; // Skip distant voxels
       }
-      
-      if (voxelData.state === 'CURRENT_TARGET') {
-        this.currentTargetKey = key;
-      }
+
+      // Add regular voxels to queue
+      this.addToQueue(key, voxelData);
     });
 
-    // Cleanup empty chunks
-    this.cleanupEmptyChunks();
-
-    // Auto-center camera on first voxel
-    let totalVoxels = 0;
-    this.chunks.forEach(chunk => {
-      totalVoxels += chunk.voxelInstances.size;
-    });
-    
-    if (totalVoxels === 1 && voxelsMap.size === 1) {
+    // Handle first voxel auto-centering (immediate processing for UX)
+    if (this.chunks.size === 0 && voxelsMap.size === 1) {
       const firstVoxel = Array.from(voxelsMap.values())[0];
       console.log('Centering camera on first voxel at:', firstVoxel.x, firstVoxel.y, firstVoxel.z);
       this.controls.target.set(firstVoxel.x, firstVoxel.y, firstVoxel.z);
       this.camera.position.set(firstVoxel.x + 30, firstVoxel.y + 30, firstVoxel.z + 30);
       this.camera.lookAt(firstVoxel.x, firstVoxel.y, firstVoxel.z);
       this.controls.update();
+      this.requestRender();
     }
+
+    // Request render since voxels were queued for updates
+    this.requestRender();
   }
 
   public centerCamera(bounds: { min: { x: number; y: number; z: number }; max: { x: number; y: number; z: number } }): void {
@@ -578,6 +727,7 @@ export class ThreeManager {
     );
     this.camera.lookAt(center);
     this.controls.update();
+    this.requestRender();
   }
 
 
@@ -585,6 +735,7 @@ export class ThreeManager {
     this.camera.aspect = window.innerWidth / window.innerHeight;
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(window.innerWidth, window.innerHeight);
+    this.requestRender();
   }
 
   public dispose(): void {
@@ -592,6 +743,10 @@ export class ThreeManager {
     if (this.animationId) {
       cancelAnimationFrame(this.animationId);
     }
+
+    // Clear processing queues
+    this.voxelUpdateQueue.length = 0;
+    this.queuedKeys.clear();
 
     // Remove event listeners
     this.renderer.domElement.removeEventListener('dblclick', this.handleDoubleClick.bind(this));
