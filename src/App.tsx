@@ -1,35 +1,55 @@
 import React from 'react';
-import logo from './logo.svg';
+import * as THREE from 'three';
+import { useVoxelStream } from './hooks/useVoxelStream';
+import VoxelCanvas from './components/VoxelCanvas';
+import StatusPanel from './components/UI/StatusPanel';
+import ControlsPanel from './components/UI/ControlsPanel';
 import './App.css';
 
 function App() {
+  const {
+    voxels,
+    stats,
+    isPaused,
+    centerRequest,
+    clearAllVoxels,
+    togglePause,
+    centerCamera
+  } = useVoxelStream('ws://localhost:8080');
+
+  const handleVoxelDoubleClick = (position: THREE.Vector3) => {
+    console.log('Double-clicked voxel at:', position);
+  };
+
   return (
-    <div className="min-h-screen bg-gray-100">
-      <header className="bg-white shadow">
-        <div className="max-w-7xl mx-auto py-6 px-4 sm:px-6 lg:px-8">
-          <h1 className="text-3xl font-bold text-gray-900">React GitHub Pages Template</h1>
-        </div>
-      </header>
-      <main>
-        <div className="max-w-7xl mx-auto py-6 sm:px-6 lg:px-8">
-          <div className="px-4 py-6 sm:px-0">
-            <div className="rounded-lg h-96 flex flex-col items-center justify-center">
-              <img src={logo} className="h-32 w-32 animate-spin" alt="logo" />
-              <p className="mt-4 text-lg text-gray-700">
-                Edit <code className="font-mono bg-gray-100 p-1 rounded">src/App.tsx</code> and save to reload.
-              </p>
-              <a
-                className="mt-4 text-blue-500 hover:text-blue-700"
-                href="https://reactjs.org"
-                target="_blank"
-                rel="noopener noreferrer"
-              >
-                Learn React
-              </a>
-            </div>
-          </div>
-        </div>
-      </main>
+    <div style={{ 
+      margin: 0, 
+      padding: 0, 
+      background: '#000', 
+      color: '#fff', 
+      fontFamily: "'Courier New', monospace", 
+      overflow: 'hidden',
+      height: '100vh',
+      width: '100vw'
+    }}>
+      {/* Three.js Canvas */}
+      <VoxelCanvas
+        voxels={voxels}
+        centerRequest={centerRequest}
+        bounds={stats.bounds}
+        onVoxelDoubleClick={handleVoxelDoubleClick}
+      />
+      
+      {/* UI Panels */}
+      <StatusPanel
+        stats={stats}
+        isPaused={isPaused}
+        onClear={clearAllVoxels}
+        onPause={togglePause}
+        onCenter={centerCamera}
+      />
+      
+      <ControlsPanel />
     </div>
   );
 }
