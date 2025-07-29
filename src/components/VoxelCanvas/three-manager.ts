@@ -2,17 +2,27 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { VoxelData, VoxelState } from '../../hooks/useVoxelStream';
 
+const CHUNK_SIZE = 16;
+const MAX_INSTANCES_PER_CHUNK = CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE; // 4096
+
+interface VoxelChunk {
+  instancedMeshes: Record<VoxelState, THREE.InstancedMesh>;
+  voxelInstances: Map<string, { state: VoxelState; instanceIndex: number }>;
+  availableIndices: Record<VoxelState, number[]>;
+  nextInstanceIndex: Record<VoxelState, number>;
+}
+
 export class ThreeManager {
   private scene: THREE.Scene;
   private camera: THREE.PerspectiveCamera;
   private renderer: THREE.WebGLRenderer;
   private controls!: OrbitControls;
   private voxelGroup: THREE.Group;
-  private voxels: Map<string, THREE.Mesh>;
   private voxelGeometry: THREE.BoxGeometry;
   private materials: Record<VoxelState, THREE.MeshLambertMaterial>;
-  private currentPositionVoxel: THREE.Mesh | null = null;
-  private currentTargetVoxel: THREE.Mesh | null = null;
+  private chunks: Map<string, VoxelChunk>;
+  private currentPositionKey: string | null = null;
+  private currentTargetKey: string | null = null;
   private animationId: number | null = null;
   
   // Camera following variables
@@ -20,6 +30,16 @@ export class ThreeManager {
   private isFollowingEnabled: boolean = true;
   private followLerpFactor: number = 0.05;
   private cameraOffset: THREE.Vector3 = new THREE.Vector3(30, 30, 30);
+  private defaultCameraOffset: THREE.Vector3 = new THREE.Vector3(30, 30, 30);
+  private userControlledCamera: boolean = false;
+  private lastCameraPosition: THREE.Vector3 = new THREE.Vector3();
+  private lastControlsTarget: THREE.Vector3 = new THREE.Vector3();
+  
+  // Culling variables
+  private cullingEnabled: boolean = false; // Disabled by default
+  private cullingDistance: number = 100; // Maximum render distance
+  private frustum: THREE.Frustum = new THREE.Frustum();
+  private cameraMatrix: THREE.Matrix4 = new THREE.Matrix4();
 
   constructor(canvas: HTMLCanvasElement) {
     // Initialize Three.js objects
@@ -27,7 +47,6 @@ export class ThreeManager {
     this.camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
     this.voxelGroup = new THREE.Group();
-    this.voxels = new Map();
     
     // Create voxel geometry
     this.voxelGeometry = new THREE.BoxGeometry(1, 1, 1);
@@ -42,9 +61,235 @@ export class ThreeManager {
       CURRENT_TARGET: new THREE.MeshLambertMaterial({ color: 0xff00ff }),
     };
 
+    // Initialize chunk management
+    this.chunks = new Map();
+
     this.initializeScene();
     this.setupControls();
+    
+    // Initialize camera tracking positions
+    this.lastCameraPosition.copy(this.camera.position);
+    this.lastControlsTarget.copy(this.controls.target);
+    
     this.startRenderLoop();
+  }
+
+  private getChunkCoords(x: number, y: number, z: number): [number, number, number] {
+    return [
+      Math.floor(x / CHUNK_SIZE),
+      Math.floor(y / CHUNK_SIZE),
+      Math.floor(z / CHUNK_SIZE)
+    ];
+  }
+
+  private getChunkKey(chunkX: number, chunkY: number, chunkZ: number): string {
+    return `${chunkX},${chunkY},${chunkZ}`;
+  }
+
+  private getLocalCoords(x: number, y: number, z: number): [number, number, number] {
+    return [
+      ((x % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE,
+      ((y % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE,
+      ((z % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE
+    ];
+  }
+
+  private getOrCreateChunk([chunkX, chunkY, chunkZ]: [number, number, number]): VoxelChunk {
+    const chunkKey = this.getChunkKey(chunkX, chunkY, chunkZ);
+    
+    if (!this.chunks.has(chunkKey)) {
+      // Create new chunk
+      const chunk: VoxelChunk = {
+        instancedMeshes: {} as Record<VoxelState, THREE.InstancedMesh>,
+        voxelInstances: new Map(),
+        availableIndices: {
+          WALKABLE: [],
+          PASSABLE: [],
+          WALL: [],
+          UNKNOWN: [],
+          CURRENT_POSITION: [],
+          CURRENT_TARGET: [],
+        },
+        nextInstanceIndex: {
+          WALKABLE: 0,
+          PASSABLE: 0,
+          WALL: 0,
+          UNKNOWN: 0,
+          CURRENT_POSITION: 0,
+          CURRENT_TARGET: 0,
+        }
+      };
+
+      // Create InstancedMesh for each voxel state in this chunk
+      Object.keys(this.materials).forEach((state) => {
+        const voxelState = state as VoxelState;
+        const instancedMesh = new THREE.InstancedMesh(
+          this.voxelGeometry,
+          this.materials[voxelState],
+          MAX_INSTANCES_PER_CHUNK
+        );
+        instancedMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+        instancedMesh.count = 0;
+        chunk.instancedMeshes[voxelState] = instancedMesh;
+        this.voxelGroup.add(instancedMesh);
+      });
+
+      this.chunks.set(chunkKey, chunk);
+    }
+
+    return this.chunks.get(chunkKey)!;
+  }
+
+  private getAvailableInstanceIndex(chunk: VoxelChunk, state: VoxelState): number {
+    // Check if there's a recycled index available
+    if (chunk.availableIndices[state].length > 0) {
+      return chunk.availableIndices[state].pop()!;
+    }
+    
+    // Check if we need to expand the InstancedMesh capacity
+    const instancedMesh = chunk.instancedMeshes[state];
+    if (chunk.nextInstanceIndex[state] >= instancedMesh.count) {
+      instancedMesh.count = chunk.nextInstanceIndex[state] + 1;
+    }
+    
+    return chunk.nextInstanceIndex[state]++;
+  }
+
+  private releaseInstanceIndex(chunk: VoxelChunk, state: VoxelState, index: number): void {
+    // Hide the instance by moving it far away
+    const matrix = new THREE.Matrix4();
+    matrix.setPosition(10000, 10000, 10000);
+    chunk.instancedMeshes[state].setMatrixAt(index, matrix);
+    chunk.instancedMeshes[state].instanceMatrix.needsUpdate = true;
+    
+    // Add to available indices for reuse
+    chunk.availableIndices[state].push(index);
+  }
+
+  private setInstanceTransform(chunk: VoxelChunk, state: VoxelState, index: number, x: number, y: number, z: number): void {
+    const matrix = new THREE.Matrix4();
+    matrix.setPosition(x, y, z);
+    chunk.instancedMeshes[state].setMatrixAt(index, matrix);
+    chunk.instancedMeshes[state].instanceMatrix.needsUpdate = true;
+  }
+
+  public setCullingEnabled(enabled: boolean): void {
+    this.cullingEnabled = enabled;
+  }
+
+  public setCullingDistance(distance: number): void {
+    this.cullingDistance = Math.max(10, distance); // Minimum distance of 10
+  }
+
+  public getCullingSettings(): { enabled: boolean; distance: number } {
+    return {
+      enabled: this.cullingEnabled,
+      distance: this.cullingDistance
+    };
+  }
+
+  public getCameraSettings(): { following: boolean; userControlled: boolean } {
+    return {
+      following: this.isFollowingEnabled,
+      userControlled: this.userControlledCamera
+    };
+  }
+
+  public setCameraFollowing(enabled: boolean): void {
+    this.isFollowingEnabled = enabled;
+    if (enabled) {
+      this.userControlledCamera = false;
+    }
+  }
+
+  public resetCameraToDefault(): void {
+    this.isFollowingEnabled = true;
+    this.userControlledCamera = false;
+    this.cameraOffset.copy(this.defaultCameraOffset);
+    
+    // If we have a current position, immediately move camera to default offset
+    if (this.currentPositionKey) {
+      const targetPosition = new THREE.Vector3().copy(this.cameraFollowTarget);
+      const desiredPosition = targetPosition.clone().add(this.cameraOffset);
+      
+      this.camera.position.copy(desiredPosition);
+      this.controls.target.copy(targetPosition);
+      this.controls.update();
+    }
+  }
+
+  private detectUserCameraControl(): void {
+    // Check if camera position or controls target changed from user interaction
+    const cameraPositionChanged = !this.camera.position.equals(this.lastCameraPosition);
+    const controlsTargetChanged = !this.controls.target.equals(this.lastControlsTarget);
+    
+    // If position changed and we're not currently doing automatic following, user is controlling
+    if ((cameraPositionChanged || controlsTargetChanged) && !this.isAutomaticallyMovingCamera) {
+      this.userControlledCamera = true;
+    }
+    
+    // Update last known positions
+    this.lastCameraPosition.copy(this.camera.position);
+    this.lastControlsTarget.copy(this.controls.target);
+  }
+
+  private isAutomaticallyMovingCamera: boolean = false;
+
+  private updateChunkVisibility(): void {
+    if (!this.cullingEnabled) {
+      // If culling is disabled, ensure all chunks are visible
+      this.chunks.forEach((chunk) => {
+        Object.values(chunk.instancedMeshes).forEach(instancedMesh => {
+          instancedMesh.visible = true;
+        });
+      });
+      return;
+    }
+
+    // Update frustum for culling calculations
+    this.cameraMatrix.multiplyMatrices(this.camera.projectionMatrix, this.camera.matrixWorldInverse);
+    this.frustum.setFromProjectionMatrix(this.cameraMatrix);
+
+    const cameraPosition = this.camera.position;
+
+    this.chunks.forEach((chunk, chunkKey) => {
+      // Parse chunk coordinates from key
+      const [chunkX, chunkY, chunkZ] = chunkKey.split(',').map(Number);
+      
+      // Calculate chunk center world position
+      const chunkCenterX = chunkX * CHUNK_SIZE + CHUNK_SIZE / 2;
+      const chunkCenterY = chunkY * CHUNK_SIZE + CHUNK_SIZE / 2;
+      const chunkCenterZ = chunkZ * CHUNK_SIZE + CHUNK_SIZE / 2;
+      
+      // Distance culling
+      const distanceToChunk = cameraPosition.distanceTo(
+        new THREE.Vector3(chunkCenterX, chunkCenterY, chunkCenterZ)
+      );
+      
+      const isVisible = distanceToChunk <= this.cullingDistance;
+      
+      // Update visibility for all InstancedMesh objects in this chunk
+      Object.values(chunk.instancedMeshes).forEach(instancedMesh => {
+        instancedMesh.visible = isVisible;
+      });
+    });
+  }
+
+  private cleanupEmptyChunks(): void {
+    const chunksToRemove: string[] = [];
+    
+    this.chunks.forEach((chunk, chunkKey) => {
+      if (chunk.voxelInstances.size === 0) {
+        // Remove all InstancedMesh objects from the scene
+        Object.values(chunk.instancedMeshes).forEach(instancedMesh => {
+          this.voxelGroup.remove(instancedMesh);
+          instancedMesh.dispose();
+        });
+        chunksToRemove.push(chunkKey);
+      }
+    });
+
+    chunksToRemove.forEach(chunkKey => this.chunks.delete(chunkKey));
   }
 
   private initializeScene(): void {
@@ -115,19 +360,33 @@ export class ThreeManager {
     const intersects = raycaster.intersectObjects(this.voxelGroup.children);
 
     if (intersects.length > 0) {
-      const target = intersects[0].object.position;
-      this.controls.target.copy(target);
-      this.controls.update();
-      console.log('Focused on voxel at:', target);
+      const intersect = intersects[0];
+      if (intersect.instanceId !== undefined) {
+        // For InstancedMesh, we get the instance position from the matrix
+        const instanceMatrix = new THREE.Matrix4();
+        (intersect.object as THREE.InstancedMesh).getMatrixAt(intersect.instanceId, instanceMatrix);
+        const position = new THREE.Vector3();
+        position.setFromMatrixPosition(instanceMatrix);
+        
+        this.controls.target.copy(position);
+        this.controls.update();
+        console.log('Focused on voxel at:', position);
+      }
     }
   };
+
 
   private startRenderLoop(): void {
     const animate = () => {
       this.animationId = requestAnimationFrame(animate);
       
+      // Detect if user is manually controlling the camera
+      this.detectUserCameraControl();
+      
       // Smooth camera following logic
-      if (this.isFollowingEnabled && this.currentPositionVoxel) {
+      if (this.isFollowingEnabled && this.currentPositionKey && !this.userControlledCamera) {
+        this.isAutomaticallyMovingCamera = true;
+        
         // Calculate desired camera position (target + offset)
         const desiredPosition = new THREE.Vector3().copy(this.cameraFollowTarget).add(this.cameraOffset);
         
@@ -140,7 +399,28 @@ export class ThreeManager {
         // Update controls target to look at the current position
         const targetDelta = new THREE.Vector3().subVectors(this.cameraFollowTarget, this.controls.target).multiplyScalar(this.followLerpFactor);
         this.controls.target.add(targetDelta);
+        
+        this.isAutomaticallyMovingCamera = false;
+      } else if (this.isFollowingEnabled && this.currentPositionKey && this.userControlledCamera) {
+        // User has manual control but following is enabled - update only the target to follow
+        // but maintain the user's chosen camera angle and distance
+        this.isAutomaticallyMovingCamera = true;
+        
+        // Calculate current offset from target
+        const currentOffset = new THREE.Vector3().subVectors(this.camera.position, this.controls.target);
+        
+        // Smoothly move target to follow the current position
+        const targetDelta = new THREE.Vector3().subVectors(this.cameraFollowTarget, this.controls.target).multiplyScalar(this.followLerpFactor);
+        this.controls.target.add(targetDelta);
+        
+        // Move camera to maintain the same relative offset
+        this.camera.position.copy(this.controls.target).add(currentOffset);
+        
+        this.isAutomaticallyMovingCamera = false;
       }
+      
+      // Update chunk visibility based on culling settings
+      this.updateChunkVisibility();
       
       this.controls.update();
       this.renderer.render(this.scene, this.camera);
@@ -149,102 +429,94 @@ export class ThreeManager {
   }
 
   public updateVoxels(voxelsMap: Map<string, VoxelData>): void {
-    // Clear existing voxels that are no longer in the new data
+    // Track chunks that need updating for cleanup
+    const updatedChunks = new Set<string>();
+    
+    // Remove voxels that are no longer in the new data
     const keysToRemove: string[] = [];
-    this.voxels.forEach((mesh, key) => {
-      if (!voxelsMap.has(key)) {
-        this.voxelGroup.remove(mesh);
-        mesh.geometry.dispose();
-        if (Array.isArray(mesh.material)) {
-          mesh.material.forEach(mat => mat.dispose());
-        } else {
-          mesh.material.dispose();
+    this.chunks.forEach((chunk, chunkKey) => {
+      chunk.voxelInstances.forEach(({ state, instanceIndex }, key) => {
+        if (!voxelsMap.has(key)) {
+          // Release the instance index
+          this.releaseInstanceIndex(chunk, state, instanceIndex);
+          keysToRemove.push(key);
+          updatedChunks.add(chunkKey);
         }
-        keysToRemove.push(key);
-      }
+      });
     });
-    keysToRemove.forEach(key => this.voxels.delete(key));
+    
+    // Remove keys from their respective chunks
+    keysToRemove.forEach(key => {
+      // Find which chunk this key belongs to
+      this.chunks.forEach((chunk) => {
+        if (chunk.voxelInstances.has(key)) {
+          chunk.voxelInstances.delete(key);
+        }
+      });
+    });
 
     // Add or update voxels
     voxelsMap.forEach((voxelData, key) => {
-      const existingMesh = this.voxels.get(key);
+      const chunkCoords = this.getChunkCoords(voxelData.x, voxelData.y, voxelData.z);
+      const chunk = this.getOrCreateChunk(chunkCoords);
+      const chunkKey = this.getChunkKey(...chunkCoords);
+      updatedChunks.add(chunkKey);
       
-      if (existingMesh) {
-        // Update existing voxel if state changed
-        const newMaterial = this.materials[voxelData.state].clone();
-        existingMesh.material = newMaterial;
+      const existingInstance = chunk.voxelInstances.get(key);
+      
+      if (existingInstance) {
+        // Check if state changed
+        if (existingInstance.state !== voxelData.state) {
+          // Release old instance and create new one with different state
+          this.releaseInstanceIndex(chunk, existingInstance.state, existingInstance.instanceIndex);
+          
+          const newInstanceIndex = this.getAvailableInstanceIndex(chunk, voxelData.state);
+          this.setInstanceTransform(chunk, voxelData.state, newInstanceIndex, voxelData.x, voxelData.y, voxelData.z);
+          
+          chunk.voxelInstances.set(key, {
+            state: voxelData.state,
+            instanceIndex: newInstanceIndex
+          });
+        } else {
+          // Just update position (in case it moved)
+          this.setInstanceTransform(chunk, voxelData.state, existingInstance.instanceIndex, voxelData.x, voxelData.y, voxelData.z);
+        }
       } else {
-        // Create new voxel
-        const material = this.materials[voxelData.state].clone();
-        const voxel = new THREE.Mesh(this.voxelGeometry, material);
-        voxel.position.set(voxelData.x, voxelData.y, voxelData.z);
+        // Create new voxel instance
+        const instanceIndex = this.getAvailableInstanceIndex(chunk, voxelData.state);
+        this.setInstanceTransform(chunk, voxelData.state, instanceIndex, voxelData.x, voxelData.y, voxelData.z);
         
-        // Add edges for better visibility
-        const edges = new THREE.EdgesGeometry(this.voxelGeometry);
-        const lineMaterial = new THREE.LineBasicMaterial({ color: 0x000000 });
-        const lineSegments = new THREE.LineSegments(edges, lineMaterial);
-        voxel.add(lineSegments);
+        chunk.voxelInstances.set(key, {
+          state: voxelData.state,
+          instanceIndex
+        });
+      }
+
+      // Handle special voxel types
+      if (voxelData.state === 'CURRENT_POSITION') {
+        this.currentPositionKey = key;
         
-        // Handle special voxel types
-        if (voxelData.state === 'CURRENT_POSITION') {
-          // Reduce opacity of previous position voxel
-          if (this.currentPositionVoxel) {
-            const prevMaterial = this.currentPositionVoxel.material as THREE.MeshLambertMaterial;
-            prevMaterial.opacity = 0.1;
-            prevMaterial.transparent = true;
-          }
-          this.currentPositionVoxel = voxel;
-          
-          // Update camera follow target
-          if (this.isFollowingEnabled) {
-            this.cameraFollowTarget.set(voxelData.x, voxelData.y, voxelData.z);
-          }
+        // Update camera follow target
+        if (this.isFollowingEnabled) {
+          this.cameraFollowTarget.set(voxelData.x, voxelData.y, voxelData.z);
         }
-        
-        if (voxelData.state === 'CURRENT_TARGET') {
-          // Reset previous target voxel
-          if (this.currentTargetVoxel) {
-            const prevMaterial = this.currentTargetVoxel.material as THREE.MeshLambertMaterial;
-            prevMaterial.opacity = 1.0;
-            prevMaterial.transparent = false;
-            prevMaterial.emissive.setHex(0x000000);
-          }
-          this.currentTargetVoxel = voxel;
-          
-          // Add highlighting
-          const targetMaterial = voxel.material as THREE.MeshLambertMaterial;
-          targetMaterial.emissive.setHex(0x444444);
-          targetMaterial.transparent = true;
-          targetMaterial.opacity = 1.0;
-          
-          // Fade highlighting after delay
-          setTimeout(() => {
-            if (voxel.material) {
-              const fadeMaterial = voxel.material as THREE.MeshLambertMaterial;
-              const fadeSteps = 30;
-              let step = 0;
-              const fadeInterval = setInterval(() => {
-                step++;
-                const progress = step / fadeSteps;
-                const glowIntensity = Math.max(0, 0x444444 * (1 - progress));
-                fadeMaterial.emissive.setHex(glowIntensity);
-                
-                if (step >= fadeSteps) {
-                  clearInterval(fadeInterval);
-                  fadeMaterial.emissive.setHex(0x000000);
-                }
-              }, 50);
-            }
-          }, 3000);
-        }
-        
-        this.voxelGroup.add(voxel);
-        this.voxels.set(key, voxel);
+      }
+      
+      if (voxelData.state === 'CURRENT_TARGET') {
+        this.currentTargetKey = key;
       }
     });
 
+    // Cleanup empty chunks
+    this.cleanupEmptyChunks();
+
     // Auto-center camera on first voxel
-    if (this.voxels.size === 1 && voxelsMap.size === 1) {
+    let totalVoxels = 0;
+    this.chunks.forEach(chunk => {
+      totalVoxels += chunk.voxelInstances.size;
+    });
+    
+    if (totalVoxels === 1 && voxelsMap.size === 1) {
       const firstVoxel = Array.from(voxelsMap.values())[0];
       console.log('Centering camera on first voxel at:', firstVoxel.x, firstVoxel.y, firstVoxel.z);
       this.controls.target.set(firstVoxel.x, firstVoxel.y, firstVoxel.z);
@@ -255,7 +527,11 @@ export class ThreeManager {
   }
 
   public centerCamera(bounds: { min: { x: number; y: number; z: number }; max: { x: number; y: number; z: number } }): void {
-    if (this.voxels.size === 0) return;
+    let totalVoxels = 0;
+    this.chunks.forEach(chunk => {
+      totalVoxels += chunk.voxelInstances.size;
+    });
+    if (totalVoxels === 0) return;
 
     // Calculate center of all voxels
     const center = new THREE.Vector3(
@@ -306,17 +582,15 @@ export class ThreeManager {
     this.renderer.domElement.removeEventListener('dblclick', this.handleDoubleClick.bind(this));
     window.removeEventListener('resize', this.onWindowResize.bind(this));
 
-    // Dispose of all voxel meshes
-    this.voxels.forEach(mesh => {
-      this.voxelGroup.remove(mesh);
-      mesh.geometry.dispose();
-      if (Array.isArray(mesh.material)) {
-        mesh.material.forEach(mat => mat.dispose());
-      } else {
-        mesh.material.dispose();
-      }
+    // Dispose of all chunks and their InstancedMesh objects
+    this.chunks.forEach((chunk) => {
+      Object.values(chunk.instancedMeshes).forEach(instancedMesh => {
+        this.voxelGroup.remove(instancedMesh);
+        instancedMesh.dispose();
+      });
+      chunk.voxelInstances.clear();
     });
-    this.voxels.clear();
+    this.chunks.clear();
 
     // Dispose of materials
     Object.values(this.materials).forEach(material => material.dispose());

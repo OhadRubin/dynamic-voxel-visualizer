@@ -3,6 +3,11 @@ import { ThreeManager } from './three-manager';
 import { VoxelData } from '../../hooks/useVoxelStream';
 import * as THREE from 'three';
 
+interface CameraControls {
+  setCameraFollowing: (enabled: boolean) => void;
+  resetCameraToDefault: () => void;
+}
+
 interface VoxelCanvasProps {
   voxels: Map<string, VoxelData>;
   centerRequest: number;
@@ -10,12 +15,20 @@ interface VoxelCanvasProps {
     min: { x: number; y: number; z: number };
     max: { x: number; y: number; z: number };
   };
+  cullingEnabled?: boolean;
+  cullingDistance?: number;
+  onCameraSettingsChange?: (settings: { following: boolean; userControlled: boolean }) => void;
+  onCameraControlsReady?: (controls: CameraControls) => void;
 }
 
 const VoxelCanvas: React.FC<VoxelCanvasProps> = ({ 
   voxels, 
   centerRequest, 
-  bounds
+  bounds,
+  cullingEnabled = false,
+  cullingDistance = 100,
+  onCameraSettingsChange,
+  onCameraControlsReady
 }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const threeManagerRef = useRef<ThreeManager | null>(null);
@@ -49,6 +62,54 @@ const VoxelCanvas: React.FC<VoxelCanvasProps> = ({
     }
   }, [centerRequest, bounds]);
 
+  useEffect(() => {
+    // Update culling enabled state
+    if (threeManagerRef.current) {
+      threeManagerRef.current.setCullingEnabled(cullingEnabled);
+    }
+  }, [cullingEnabled]);
+
+  useEffect(() => {
+    // Update culling distance
+    if (threeManagerRef.current) {
+      threeManagerRef.current.setCullingDistance(cullingDistance);
+    }
+  }, [cullingDistance]);
+
+  useEffect(() => {
+    // Monitor camera settings and notify parent
+    const checkCameraSettings = () => {
+      if (threeManagerRef.current && onCameraSettingsChange) {
+        const settings = threeManagerRef.current.getCameraSettings();
+        onCameraSettingsChange(settings);
+      }
+    };
+
+    const interval = setInterval(checkCameraSettings, 100); // Check every 100ms
+    return () => clearInterval(interval);
+  }, [onCameraSettingsChange]);
+
+  // Create camera control methods
+  const cameraControls: CameraControls = {
+    setCameraFollowing: (enabled: boolean) => {
+      if (threeManagerRef.current) {
+        threeManagerRef.current.setCameraFollowing(enabled);
+      }
+    },
+    resetCameraToDefault: () => {
+      if (threeManagerRef.current) {
+        threeManagerRef.current.resetCameraToDefault();
+      }
+    }
+  };
+
+  // Notify parent when camera controls are ready
+  useEffect(() => {
+    if (onCameraControlsReady && threeManagerRef.current) {
+      onCameraControlsReady(cameraControls);
+    }
+  }, [onCameraControlsReady]);
+
   return (
     <canvas 
       ref={canvasRef} 
@@ -62,3 +123,4 @@ const VoxelCanvas: React.FC<VoxelCanvasProps> = ({
 };
 
 export default VoxelCanvas;
+export type { CameraControls };

@@ -3,6 +3,7 @@ import Panel from '../Panel';
 import StatItem from './StatItem';
 import ColorLegend from './ColorLegend';
 import ActionButtons from '../../ActionButtons';
+import { CameraControls } from '../../VoxelCanvas';
 
 interface StatusPanelProps {
   stats: {
@@ -19,6 +20,12 @@ interface StatusPanelProps {
   onPause: () => void;
   onCenter: () => void;
   isPaused: boolean;
+  cullingEnabled: boolean;
+  cullingDistance: number;
+  onCullingEnabledChange: (enabled: boolean) => void;
+  onCullingDistanceChange: (distance: number) => void;
+  cameraSettings: { following: boolean; userControlled: boolean };
+  cameraControls: CameraControls | null;
 }
 
 const StatusPanel: React.FC<StatusPanelProps> = ({ 
@@ -26,7 +33,13 @@ const StatusPanel: React.FC<StatusPanelProps> = ({
   onClear, 
   onPause, 
   onCenter, 
-  isPaused 
+  isPaused,
+  cullingEnabled,
+  cullingDistance,
+  onCullingEnabledChange,
+  onCullingDistanceChange,
+  cameraSettings,
+  cameraControls
 }) => {
   const getConnectionStatusDisplay = () => {
     const statusStyle: React.CSSProperties = {
@@ -129,6 +142,95 @@ const StatusPanel: React.FC<StatusPanelProps> = ({
         onPause={onPause}
         onCenter={onCenter}
       />
+      
+      <hr style={hrStyle} />
+      
+      {/* Culling Controls */}
+      <div style={{ fontSize: '12px' }}>
+        <div style={{ fontWeight: 'bold', marginBottom: '8px' }}>🎯 Culling Controls:</div>
+        
+        <div style={{ marginBottom: '10px' }}>
+          <label style={{ display: 'flex', alignItems: 'center' }}>
+            <input
+              type="checkbox"
+              checked={cullingEnabled}
+              onChange={(e) => onCullingEnabledChange(e.target.checked)}
+              style={{ marginRight: '8px' }}
+            />
+            Enable Distance Culling
+          </label>
+        </div>
+        
+        <div style={{ opacity: cullingEnabled ? 1 : 0.5 }}>
+          <div style={{ marginBottom: '5px', fontWeight: 'bold' }}>
+            Distance: {cullingDistance}
+          </div>
+          <input
+            type="range"
+            min="10"
+            max="500"
+            step="10"
+            value={cullingDistance}
+            onChange={(e) => onCullingDistanceChange(parseInt(e.target.value))}
+            disabled={!cullingEnabled}
+            style={{ width: '100%' }}
+          />
+          <div style={{ fontSize: '10px', color: '#888', textAlign: 'center' }}>
+            10 - 500 units
+          </div>
+        </div>
+      </div>
+      
+      <hr style={hrStyle} />
+      
+      {/* Camera Controls */}
+      <div style={{ fontSize: '12px' }}>
+        <div style={{ fontWeight: 'bold', marginBottom: '8px' }}>📷 Camera Controls:</div>
+        
+        <div style={{ marginBottom: '8px' }}>
+          <div style={{ fontSize: '10px', color: cameraSettings.userControlled ? '#ffaa44' : '#44ff44' }}>
+            Status: {cameraSettings.userControlled ? 'Manual Control' : 'Auto Following'}
+          </div>
+        </div>
+        
+        <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+          <button
+            onClick={() => cameraControls?.setCameraFollowing(!cameraSettings.following)}
+            disabled={!cameraControls}
+            style={{
+              fontSize: '10px',
+              padding: '4px 8px',
+              background: cameraSettings.following ? '#44ff44' : '#666',
+              color: cameraSettings.following ? '#000' : '#fff',
+              border: 'none',
+              borderRadius: '3px',
+              cursor: cameraControls ? 'pointer' : 'not-allowed'
+            }}
+          >
+            {cameraSettings.following ? '✓ Following' : 'Enable Follow'}
+          </button>
+          
+          <button
+            onClick={() => cameraControls?.resetCameraToDefault()}
+            disabled={!cameraControls}
+            style={{
+              fontSize: '10px',
+              padding: '4px 8px',
+              background: '#ff6644',
+              color: '#fff',
+              border: 'none',
+              borderRadius: '3px',
+              cursor: cameraControls ? 'pointer' : 'not-allowed'
+            }}
+          >
+            Reset to Default
+          </button>
+        </div>
+        
+        <div style={{ fontSize: '9px', color: '#888', marginTop: '5px' }}>
+          Use mouse to manually control camera. Reset to restore following.
+        </div>
+      </div>
       
       <ColorLegend />
     </Panel>
