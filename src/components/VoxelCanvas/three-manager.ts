@@ -5,11 +5,21 @@ import { VoxelData, VoxelState } from '../../hooks/useVoxelStream';
 const CHUNK_SIZE = 16;
 const MAX_INSTANCES_PER_CHUNK = CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE; // 4096
 
+// LOD (Level of Detail) system
+enum LODLevel {
+  HIGH = 0,    // 0-225 units: Full detail voxels
+  MEDIUM = 1,  // 225-600 units: Simplified voxels (0.7x scale)
+  LOW = 2,     // 600-1200 units: Point sprites
+  CULLED = 3   // 1200+ units: Not rendered
+}
+
+const LOD_DISTANCES = [225, 600, 1200];
+
 interface VoxelChunk {
-  instancedMeshes: Record<VoxelState, THREE.InstancedMesh>;
-  voxelInstances: Map<string, { state: VoxelState; instanceIndex: number }>;
-  availableIndices: Record<VoxelState, number[]>;
-  nextInstanceIndex: Record<VoxelState, number>;
+  instancedMeshes: Record<VoxelState, Record<LODLevel, THREE.InstancedMesh>>;
+  voxelInstances: Map<string, { state: VoxelState; instanceIndex: number; lodLevel: LODLevel }>;
+  availableIndices: Record<VoxelState, Record<LODLevel, number[]>>;
+  nextInstanceIndex: Record<VoxelState, Record<LODLevel, number>>;
 }
 
 export class ThreeManager {
@@ -18,8 +28,9 @@ export class ThreeManager {
   private renderer: THREE.WebGLRenderer;
   private controls!: OrbitControls;
   private voxelGroup: THREE.Group;
-  private voxelGeometry: THREE.BoxGeometry;
+  private voxelGeometries: Record<LODLevel, THREE.BufferGeometry>;
   private materials: Record<VoxelState, THREE.MeshLambertMaterial>;
+  private pointMaterials: Record<VoxelState, THREE.PointsMaterial>;
   private chunks: Map<string, VoxelChunk>;
   private currentPositionKey: string | null = null;
   private currentTargetKey: string | null = null;
@@ -48,10 +59,15 @@ export class ThreeManager {
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
     this.voxelGroup = new THREE.Group();
     
-    // Create voxel geometry
-    this.voxelGeometry = new THREE.BoxGeometry(1, 1, 1);
+    // Create geometries for different LOD levels
+    this.voxelGeometries = {
+      [LODLevel.HIGH]: new THREE.BoxGeometry(1, 1, 1),      // Full detail
+      [LODLevel.MEDIUM]: new THREE.BoxGeometry(0.7, 0.7, 0.7), // Simplified
+      [LODLevel.LOW]: this.createPointGeometry(),            // Point sprites
+      [LODLevel.CULLED]: new THREE.BoxGeometry(1, 1, 1)     // Dummy (not used)
+    };
     
-    // Create materials for different voxel states - using MeshLambertMaterial for emissive support
+    // Create materials for different voxel states - using MeshLambertMaterial for mesh LODs
     this.materials = {
       WALKABLE: new THREE.MeshLambertMaterial({ color: 0x00ff00 }),
       PASSABLE: new THREE.MeshLambertMaterial({ color: 0xffff00 }),
@@ -59,6 +75,16 @@ export class ThreeManager {
       UNKNOWN: new THREE.MeshLambertMaterial({ color: 0x00ffff }),
       CURRENT_POSITION: new THREE.MeshLambertMaterial({ color: 0x0000ff }),
       CURRENT_TARGET: new THREE.MeshLambertMaterial({ color: 0xff00ff }),
+    };
+
+    // Create point materials for LOD level 2 (point sprites)
+    this.pointMaterials = {
+      WALKABLE: new THREE.PointsMaterial({ color: 0x00ff00, size: 3 }),
+      PASSABLE: new THREE.PointsMaterial({ color: 0xffff00, size: 3 }),
+      WALL: new THREE.PointsMaterial({ color: 0xff0000, size: 3 }),
+      UNKNOWN: new THREE.PointsMaterial({ color: 0x00ffff, size: 3 }),
+      CURRENT_POSITION: new THREE.PointsMaterial({ color: 0x0000ff, size: 5 }),
+      CURRENT_TARGET: new THREE.PointsMaterial({ color: 0xff00ff, size: 5 }),
     };
 
     // Initialize chunk management
@@ -72,6 +98,15 @@ export class ThreeManager {
     this.lastControlsTarget.copy(this.controls.target);
     
     this.startRenderLoop();
+  }
+
+  private createPointGeometry(): THREE.BufferGeometry {
+    const geometry = new THREE.BufferGeometry();
+    // Create buffer for MAX_INSTANCES_PER_CHUNK points
+    const positions = new Float32Array(MAX_INSTANCES_PER_CHUNK * 3);
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geometry.setDrawRange(0, 0); // Initially draw 0 points
+    return geometry;
   }
 
   private getChunkCoords(x: number, y: number, z: number): [number, number, number] {
@@ -100,38 +135,46 @@ export class ThreeManager {
     if (!this.chunks.has(chunkKey)) {
       // Create new chunk
       const chunk: VoxelChunk = {
-        instancedMeshes: {} as Record<VoxelState, THREE.InstancedMesh>,
+        instancedMeshes: {} as Record<VoxelState, Record<LODLevel, THREE.InstancedMesh>>,
         voxelInstances: new Map(),
-        availableIndices: {
-          WALKABLE: [],
-          PASSABLE: [],
-          WALL: [],
-          UNKNOWN: [],
-          CURRENT_POSITION: [],
-          CURRENT_TARGET: [],
-        },
-        nextInstanceIndex: {
-          WALKABLE: 0,
-          PASSABLE: 0,
-          WALL: 0,
-          UNKNOWN: 0,
-          CURRENT_POSITION: 0,
-          CURRENT_TARGET: 0,
-        }
+        availableIndices: {} as Record<VoxelState, Record<LODLevel, number[]>>,
+        nextInstanceIndex: {} as Record<VoxelState, Record<LODLevel, number>>
       };
 
-      // Create InstancedMesh for each voxel state in this chunk
+      // Initialize arrays for each voxel state and LOD level
       Object.keys(this.materials).forEach((state) => {
         const voxelState = state as VoxelState;
-        const instancedMesh = new THREE.InstancedMesh(
-          this.voxelGeometry,
-          this.materials[voxelState],
-          MAX_INSTANCES_PER_CHUNK
-        );
-        instancedMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-        instancedMesh.count = 0;
-        chunk.instancedMeshes[voxelState] = instancedMesh;
-        this.voxelGroup.add(instancedMesh);
+        chunk.instancedMeshes[voxelState] = {} as Record<LODLevel, THREE.InstancedMesh>;
+        chunk.availableIndices[voxelState] = {} as Record<LODLevel, number[]>;
+        chunk.nextInstanceIndex[voxelState] = {} as Record<LODLevel, number>;
+
+        // Create InstancedMesh for each LOD level
+        [LODLevel.HIGH, LODLevel.MEDIUM, LODLevel.LOW].forEach((lodLevel) => {
+          let instancedMesh: THREE.InstancedMesh | THREE.Points;
+          
+          if (lodLevel === LODLevel.LOW) {
+            // Use Points for low LOD - create unique geometry per chunk
+            const pointGeometry = this.createPointGeometry();
+            instancedMesh = new THREE.Points(
+              pointGeometry,
+              this.pointMaterials[voxelState]
+            ) as any; // Type assertion for compatibility
+          } else {
+            // Use InstancedMesh for high and medium LOD
+            instancedMesh = new THREE.InstancedMesh(
+              this.voxelGeometries[lodLevel],
+              this.materials[voxelState],
+              MAX_INSTANCES_PER_CHUNK
+            );
+            instancedMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+          }
+          
+          (instancedMesh as any).count = 0;
+          chunk.instancedMeshes[voxelState][lodLevel] = instancedMesh as THREE.InstancedMesh;
+          chunk.availableIndices[voxelState][lodLevel] = [];
+          chunk.nextInstanceIndex[voxelState][lodLevel] = 0;
+          this.voxelGroup.add(instancedMesh);
+        });
       });
 
       this.chunks.set(chunkKey, chunk);
@@ -140,37 +183,77 @@ export class ThreeManager {
     return this.chunks.get(chunkKey)!;
   }
 
-  private getAvailableInstanceIndex(chunk: VoxelChunk, state: VoxelState): number {
+  private getAvailableInstanceIndex(chunk: VoxelChunk, state: VoxelState, lodLevel: LODLevel): number {
     // Check if there's a recycled index available
-    if (chunk.availableIndices[state].length > 0) {
-      return chunk.availableIndices[state].pop()!;
+    if (chunk.availableIndices[state][lodLevel].length > 0) {
+      return chunk.availableIndices[state][lodLevel].pop()!;
     }
     
     // Check if we need to expand the InstancedMesh capacity
-    const instancedMesh = chunk.instancedMeshes[state];
-    if (chunk.nextInstanceIndex[state] >= instancedMesh.count) {
-      instancedMesh.count = chunk.nextInstanceIndex[state] + 1;
+    const instancedMesh = chunk.instancedMeshes[state][lodLevel];
+    if (chunk.nextInstanceIndex[state][lodLevel] >= instancedMesh.count) {
+      instancedMesh.count = chunk.nextInstanceIndex[state][lodLevel] + 1;
     }
     
-    return chunk.nextInstanceIndex[state]++;
+    return chunk.nextInstanceIndex[state][lodLevel]++;
   }
 
-  private releaseInstanceIndex(chunk: VoxelChunk, state: VoxelState, index: number): void {
+  private releaseInstanceIndex(chunk: VoxelChunk, state: VoxelState, lodLevel: LODLevel, index: number): void {
+    if (lodLevel === LODLevel.LOW) {
+      // For points, mark position as invalid and add to available indices
+      const pointsMesh = chunk.instancedMeshes[state][lodLevel] as any as THREE.Points;
+      const geometry = pointsMesh.geometry as THREE.BufferGeometry;
+      const positions = geometry.attributes.position.array as Float32Array;
+      
+      if (index * 3 + 2 < positions.length) {
+        // Move point far away to hide it
+        positions[index * 3] = 100000;
+        positions[index * 3 + 1] = 100000;
+        positions[index * 3 + 2] = 100000;
+        geometry.attributes.position.needsUpdate = true;
+      }
+      
+      chunk.availableIndices[state][lodLevel].push(index);
+      return;
+    }
+
     // Hide the instance by moving it far away
     const matrix = new THREE.Matrix4();
     matrix.setPosition(10000, 10000, 10000);
-    chunk.instancedMeshes[state].setMatrixAt(index, matrix);
-    chunk.instancedMeshes[state].instanceMatrix.needsUpdate = true;
+    chunk.instancedMeshes[state][lodLevel].setMatrixAt(index, matrix);
+    chunk.instancedMeshes[state][lodLevel].instanceMatrix.needsUpdate = true;
     
     // Add to available indices for reuse
-    chunk.availableIndices[state].push(index);
+    chunk.availableIndices[state][lodLevel].push(index);
   }
 
-  private setInstanceTransform(chunk: VoxelChunk, state: VoxelState, index: number, x: number, y: number, z: number): void {
+  private setInstanceTransform(chunk: VoxelChunk, state: VoxelState, lodLevel: LODLevel, index: number, x: number, y: number, z: number): void {
+    if (lodLevel === LODLevel.LOW) {
+      // For points, update the geometry directly
+      const pointsMesh = chunk.instancedMeshes[state][lodLevel] as any as THREE.Points;
+      const geometry = pointsMesh.geometry as THREE.BufferGeometry;
+      const positions = geometry.attributes.position.array as Float32Array;
+      
+      if (index * 3 + 2 < positions.length) {
+        positions[index * 3] = x;
+        positions[index * 3 + 1] = y;
+        positions[index * 3 + 2] = z;
+        geometry.attributes.position.needsUpdate = true;
+        
+        // Update draw range to include this point
+        const currentCount = (pointsMesh as any).count || 0;
+        if (index >= currentCount) {
+          geometry.setDrawRange(0, index + 1);
+          (pointsMesh as any).count = index + 1;
+        }
+      }
+      return;
+    }
+
     const matrix = new THREE.Matrix4();
     matrix.setPosition(x, y, z);
-    chunk.instancedMeshes[state].setMatrixAt(index, matrix);
-    chunk.instancedMeshes[state].instanceMatrix.needsUpdate = true;
+    chunk.instancedMeshes[state][lodLevel].setMatrixAt(index, matrix);
+    chunk.instancedMeshes[state][lodLevel].instanceMatrix.needsUpdate = true;
   }
 
   public setCullingEnabled(enabled: boolean): void {
@@ -246,17 +329,25 @@ export class ThreeManager {
   private isProcessingBatch: boolean = false;
   private readonly BATCH_SIZE = 300; // Process up to 300 voxels per frame
   private readonly FRAME_BUDGET_MS = 14; // Max 14ms per frame for voxel processing
-  private readonly MAX_QUEUE_SIZE = 2000; // Drop old voxels if queue exceeds this
-  private readonly SPATIAL_CULL_DISTANCE = 150; // Only process voxels within this distance
+  private readonly MAX_QUEUE_SIZE = 1000; // Drop old voxels if queue exceeds this (reduced)
+  private readonly SPATIAL_CULL_DISTANCE = 1200; // Only process voxels within this distance (matches LOD_DISTANCES[2])
+  private readonly MAX_TOTAL_VOXELS = 8000; // Maximum total voxels to prevent memory bloat
+  private readonly CLEANUP_DISTANCE = 2000; // Remove voxels beyond this distance periodically
+  private lastCleanupTime = 0;
+  private readonly CLEANUP_INTERVAL_MS = 5000; // Clean up every 5 seconds
+  
+  // Performance monitoring
+  private frameCount = 0;
+  private lastPerformanceLog = 0;
 
   private requestRender(): void {
     this.needsRender = true;
   }
 
-  private shouldCullVoxel(voxelData: VoxelData): boolean {
-    // Never cull critical voxels
+  private calculateLODLevel(voxelData: VoxelData): LODLevel {
+    // Always use high LOD for critical voxels
     if (voxelData.state === 'CURRENT_POSITION' || voxelData.state === 'CURRENT_TARGET') {
-      return false;
+      return LODLevel.HIGH;
     }
 
     // Calculate distance from camera
@@ -264,7 +355,129 @@ export class ThreeManager {
       new THREE.Vector3(voxelData.x, voxelData.y, voxelData.z)
     );
     
-    return distance > this.SPATIAL_CULL_DISTANCE;
+    // Determine LOD level based on distance
+    if (distance < LOD_DISTANCES[0]) return LODLevel.HIGH;
+    if (distance < LOD_DISTANCES[1]) return LODLevel.MEDIUM;
+    if (distance < LOD_DISTANCES[2]) return LODLevel.LOW;
+    return LODLevel.CULLED;
+  }
+
+  private shouldCullVoxel(voxelData: VoxelData): boolean {
+    return this.calculateLODLevel(voxelData) === LODLevel.CULLED;
+  }
+
+  private getTotalVoxelCount(): number {
+    let total = 0;
+    this.chunks.forEach(chunk => {
+      total += chunk.voxelInstances.size;
+    });
+    return total;
+  }
+
+  private performPeriodicCleanup(): void {
+    const now = performance.now();
+    if (now - this.lastCleanupTime < this.CLEANUP_INTERVAL_MS) {
+      return;
+    }
+    this.lastCleanupTime = now;
+
+    const cameraPos = this.camera.position;
+    const voxelsToRemove: Array<{chunk: VoxelChunk, key: string}> = [];
+
+    // Find voxels beyond cleanup distance
+    this.chunks.forEach((chunk) => {
+      chunk.voxelInstances.forEach((instance, key) => {
+        // Parse coordinates from key
+        const [x, y, z] = key.split(',').map(Number);
+        const distance = cameraPos.distanceTo(new THREE.Vector3(x, y, z));
+        
+        // Don't remove critical voxels
+        if (instance.state === 'CURRENT_POSITION' || instance.state === 'CURRENT_TARGET') {
+          return;
+        }
+
+        if (distance > this.CLEANUP_DISTANCE) {
+          voxelsToRemove.push({ chunk, key });
+        }
+      });
+    });
+
+    // Remove distant voxels
+    voxelsToRemove.forEach(({ chunk, key }) => {
+      const instance = chunk.voxelInstances.get(key);
+      if (instance) {
+        this.releaseInstanceIndex(chunk, instance.state, instance.lodLevel, instance.instanceIndex);
+        chunk.voxelInstances.delete(key);
+      }
+    });
+
+    if (voxelsToRemove.length > 0) {
+      console.log(`Cleaned up ${voxelsToRemove.length} distant voxels`);
+      this.cleanupEmptyChunks();
+    }
+  }
+
+  private enforceVoxelLimit(): void {
+    const totalVoxels = this.getTotalVoxelCount();
+    
+    if (totalVoxels <= this.MAX_TOTAL_VOXELS) {
+      return;
+    }
+
+    const excessVoxels = totalVoxels - this.MAX_TOTAL_VOXELS;
+    const cameraPos = this.camera.position;
+    
+    // Collect all voxels with their distances
+    const voxelsByDistance: Array<{
+      chunk: VoxelChunk,
+      key: string,
+      distance: number,
+      instance: { state: VoxelState; instanceIndex: number; lodLevel: LODLevel }
+    }> = [];
+
+    this.chunks.forEach((chunk) => {
+      chunk.voxelInstances.forEach((instance, key) => {
+        // Don't remove critical voxels
+        if (instance.state === 'CURRENT_POSITION' || instance.state === 'CURRENT_TARGET') {
+          return;
+        }
+
+        const [x, y, z] = key.split(',').map(Number);
+        const distance = cameraPos.distanceTo(new THREE.Vector3(x, y, z));
+        
+        voxelsByDistance.push({ chunk, key, distance, instance });
+      });
+    });
+
+    // Sort by distance (farthest first) and remove excess
+    voxelsByDistance.sort((a, b) => b.distance - a.distance);
+    const toRemove = voxelsByDistance.slice(0, Math.min(excessVoxels, voxelsByDistance.length));
+
+    toRemove.forEach(({ chunk, key, instance }) => {
+      this.releaseInstanceIndex(chunk, instance.state, instance.lodLevel, instance.instanceIndex);
+      chunk.voxelInstances.delete(key);
+    });
+
+    if (toRemove.length > 0) {
+      console.log(`Removed ${toRemove.length} excess voxels (limit: ${this.MAX_TOTAL_VOXELS})`);
+      this.cleanupEmptyChunks();
+    }
+  }
+
+  private logPerformance(): void {
+    this.frameCount++;
+    const now = performance.now();
+    
+    if (now - this.lastPerformanceLog > 10000) { // Every 10 seconds
+      const totalVoxels = this.getTotalVoxelCount();
+      const queueSize = this.voxelUpdateQueue.length;
+      const chunkCount = this.chunks.size;
+      
+      console.log(`Performance: ${totalVoxels} voxels, ${chunkCount} chunks, ${queueSize} queued, ~${(this.frameCount / 10).toFixed(1)} fps`);
+      
+      this.frameCount = 0;
+      this.lastPerformanceLog = now;
+    }
   }
 
   private addToQueue(key: string, voxelData: VoxelData | null): void {
@@ -278,10 +491,10 @@ export class ThreeManager {
       return;
     }
 
-    // Check queue size limit
+    // Check queue size limit (more aggressive)
     if (this.voxelUpdateQueue.length >= this.MAX_QUEUE_SIZE) {
       // Remove oldest items to make space
-      const toRemove = this.voxelUpdateQueue.splice(0, 100); // Remove 100 oldest
+      const toRemove = this.voxelUpdateQueue.splice(0, 200); // Remove 200 oldest (increased)
       toRemove.forEach(item => this.queuedKeys.delete(item.key));
     }
 
@@ -294,20 +507,25 @@ export class ThreeManager {
       return;
     }
 
+    // If queue is getting too large, be more aggressive
+    const isQueueOverloaded = this.voxelUpdateQueue.length > this.MAX_QUEUE_SIZE * 0.8;
+    const currentBatchSize = isQueueOverloaded ? this.BATCH_SIZE * 2 : this.BATCH_SIZE;
+    const currentFrameBudget = isQueueOverloaded ? this.FRAME_BUDGET_MS * 1.5 : this.FRAME_BUDGET_MS;
+
     this.isProcessingBatch = true;
     const startTime = performance.now();
     let processedCount = 0;
     let totalProcessed = 0;
 
     // Process multiple batches if time allows
-    while ((performance.now() - startTime) < this.FRAME_BUDGET_MS) {
+    while ((performance.now() - startTime) < currentFrameBudget) {
       processedCount = 0;
       
       // Process regular queue
       while (
         this.voxelUpdateQueue.length > 0 &&
-        processedCount < this.BATCH_SIZE &&
-        (performance.now() - startTime) < this.FRAME_BUDGET_MS
+        processedCount < currentBatchSize &&
+        (performance.now() - startTime) < currentFrameBudget
       ) {
         const update = this.voxelUpdateQueue.shift()!;
         this.queuedKeys.delete(update.key); // Remove from deduplication set
@@ -342,10 +560,18 @@ export class ThreeManager {
       this.chunks.forEach((chunk) => {
         const existingInstance = chunk.voxelInstances.get(key);
         if (existingInstance) {
-          this.releaseInstanceIndex(chunk, existingInstance.state, existingInstance.instanceIndex);
+          this.releaseInstanceIndex(chunk, existingInstance.state, existingInstance.lodLevel, existingInstance.instanceIndex);
           chunk.voxelInstances.delete(key);
         }
       });
+      return;
+    }
+
+    // Calculate LOD level for this voxel
+    const lodLevel = this.calculateLODLevel(voxelData);
+    
+    // Skip if culled
+    if (lodLevel === LODLevel.CULLED) {
       return;
     }
 
@@ -356,30 +582,32 @@ export class ThreeManager {
     const existingInstance = chunk.voxelInstances.get(key);
     
     if (existingInstance) {
-      // Check if state changed
-      if (existingInstance.state !== voxelData.state) {
-        // Release old instance and create new one with different state
-        this.releaseInstanceIndex(chunk, existingInstance.state, existingInstance.instanceIndex);
+      // Check if state or LOD level changed
+      if (existingInstance.state !== voxelData.state || existingInstance.lodLevel !== lodLevel) {
+        // Release old instance and create new one with different state/LOD
+        this.releaseInstanceIndex(chunk, existingInstance.state, existingInstance.lodLevel, existingInstance.instanceIndex);
         
-        const newInstanceIndex = this.getAvailableInstanceIndex(chunk, voxelData.state);
-        this.setInstanceTransform(chunk, voxelData.state, newInstanceIndex, voxelData.x, voxelData.y, voxelData.z);
+        const newInstanceIndex = this.getAvailableInstanceIndex(chunk, voxelData.state, lodLevel);
+        this.setInstanceTransform(chunk, voxelData.state, lodLevel, newInstanceIndex, voxelData.x, voxelData.y, voxelData.z);
         
         chunk.voxelInstances.set(key, {
           state: voxelData.state,
-          instanceIndex: newInstanceIndex
+          instanceIndex: newInstanceIndex,
+          lodLevel: lodLevel
         });
       } else {
         // Just update position (in case it moved)
-        this.setInstanceTransform(chunk, voxelData.state, existingInstance.instanceIndex, voxelData.x, voxelData.y, voxelData.z);
+        this.setInstanceTransform(chunk, voxelData.state, lodLevel, existingInstance.instanceIndex, voxelData.x, voxelData.y, voxelData.z);
       }
     } else {
       // Create new voxel instance
-      const instanceIndex = this.getAvailableInstanceIndex(chunk, voxelData.state);
-      this.setInstanceTransform(chunk, voxelData.state, instanceIndex, voxelData.x, voxelData.y, voxelData.z);
+      const instanceIndex = this.getAvailableInstanceIndex(chunk, voxelData.state, lodLevel);
+      this.setInstanceTransform(chunk, voxelData.state, lodLevel, instanceIndex, voxelData.x, voxelData.y, voxelData.z);
       
       chunk.voxelInstances.set(key, {
         state: voxelData.state,
-        instanceIndex
+        instanceIndex,
+        lodLevel: lodLevel
       });
     }
 
@@ -401,8 +629,10 @@ export class ThreeManager {
   private updateChunkVisibility(): void {
     // Always ensure all chunks are visible - culling disabled for stability
     this.chunks.forEach((chunk) => {
-      Object.values(chunk.instancedMeshes).forEach(instancedMesh => {
-        instancedMesh.visible = true;
+      Object.values(chunk.instancedMeshes).forEach(stateMeshes => {
+        Object.values(stateMeshes).forEach(instancedMesh => {
+          instancedMesh.visible = true;
+        });
       });
     });
     
@@ -459,9 +689,14 @@ export class ThreeManager {
     this.chunks.forEach((chunk, chunkKey) => {
       if (chunk.voxelInstances.size === 0) {
         // Remove all InstancedMesh objects from the scene
-        Object.values(chunk.instancedMeshes).forEach(instancedMesh => {
-          this.voxelGroup.remove(instancedMesh);
-          instancedMesh.dispose();
+        Object.values(chunk.instancedMeshes).forEach(stateMeshes => {
+          Object.values(stateMeshes).forEach(instancedMesh => {
+            this.voxelGroup.remove(instancedMesh);
+            // Dispose geometry only for Points (LOW LOD level has unique geometry per chunk)
+            if ((instancedMesh as any).isPoints) {
+              instancedMesh.geometry.dispose();
+            }
+          });
         });
         chunksToRemove.push(chunkKey);
       }
@@ -628,8 +863,15 @@ export class ThreeManager {
       // Process batched voxel updates
       this.processBatchedVoxelUpdates();
       
+      // Perform periodic cleanup and enforce limits
+      this.performPeriodicCleanup();
+      this.enforceVoxelLimit();
+      
       // Update chunk visibility based on culling settings
       this.updateChunkVisibility();
+      
+      // Performance monitoring
+      this.logPerformance();
       
       // Only render if something changed
       if (shouldRender || this.isUserInteracting) {
@@ -754,9 +996,14 @@ export class ThreeManager {
 
     // Dispose of all chunks and their InstancedMesh objects
     this.chunks.forEach((chunk) => {
-      Object.values(chunk.instancedMeshes).forEach(instancedMesh => {
-        this.voxelGroup.remove(instancedMesh);
-        instancedMesh.dispose();
+      Object.values(chunk.instancedMeshes).forEach(stateMeshes => {
+        Object.values(stateMeshes).forEach(instancedMesh => {
+          this.voxelGroup.remove(instancedMesh);
+          // Dispose geometry only for Points (LOW LOD level has unique geometry per chunk)
+          if ((instancedMesh as any).isPoints) {
+            instancedMesh.geometry.dispose();
+          }
+        });
       });
       chunk.voxelInstances.clear();
     });
@@ -764,9 +1011,10 @@ export class ThreeManager {
 
     // Dispose of materials
     Object.values(this.materials).forEach(material => material.dispose());
+    Object.values(this.pointMaterials).forEach(material => material.dispose());
 
-    // Dispose of geometry
-    this.voxelGeometry.dispose();
+    // Dispose of geometries
+    Object.values(this.voxelGeometries).forEach(geometry => geometry.dispose());
 
     // Dispose of controls
     this.controls.dispose();
