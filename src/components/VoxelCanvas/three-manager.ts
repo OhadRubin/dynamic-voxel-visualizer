@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { VoxelData, VoxelState } from '../../hooks/useVoxelStream';
+import { perfTracker } from '../../utils/performance-tracker';
 
 const CHUNK_SIZE = 16;
 const MAX_INSTANCES_PER_CHUNK = CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE; // 4096
@@ -808,6 +809,7 @@ export class ThreeManager {
     const animate = () => {
       this.animationId = requestAnimationFrame(animate);
       
+      const loopStartTime = performance.now();
       let shouldRender = this.needsRender;
       
       // Detect if user is manually controlling the camera
@@ -861,7 +863,9 @@ export class ThreeManager {
       }
       
       // Process batched voxel updates
+      const batchStartTime = performance.now();
       this.processBatchedVoxelUpdates();
+      perfTracker.record('processBatchedVoxelUpdates', performance.now() - batchStartTime);
       
       // Perform periodic cleanup and enforce limits
       this.performPeriodicCleanup();
@@ -875,10 +879,15 @@ export class ThreeManager {
       
       // Only render if something changed
       if (shouldRender || this.isUserInteracting) {
+        const renderStartTime = performance.now();
         this.controls.update();
         this.renderer.render(this.scene, this.camera);
         this.needsRender = false;
+        perfTracker.record('render', performance.now() - renderStartTime);
       }
+      
+      perfTracker.record('renderLoop', performance.now() - loopStartTime);
+      perfTracker.summarize();
     };
     animate();
   }

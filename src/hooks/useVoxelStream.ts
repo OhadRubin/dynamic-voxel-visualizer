@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
+import { perfTracker } from '../utils/performance-tracker';
 
 export type VoxelState = 'WALKABLE' | 'PASSABLE' | 'WALL' | 'UNKNOWN' | 'CURRENT_POSITION' | 'CURRENT_TARGET';
 
@@ -65,6 +66,7 @@ export const useVoxelStream = (websocketUrl: string) => {
       ws.onmessage = (event) => {
         if (isPaused) return;
 
+        const startTime = performance.now();
         try {
           const data = JSON.parse(event.data);
           
@@ -135,6 +137,7 @@ export const useVoxelStream = (websocketUrl: string) => {
         } catch (error) {
           console.error('Error parsing WebSocket message:', error);
         }
+        perfTracker.record('onmessage', performance.now() - startTime);
       };
 
       ws.onclose = () => {

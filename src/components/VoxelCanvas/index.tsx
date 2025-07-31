@@ -2,6 +2,7 @@ import React, { useRef, useEffect } from 'react';
 import { ThreeManager } from './three-manager';
 import { VoxelData } from '../../hooks/useVoxelStream';
 import * as THREE from 'three';
+import { perfTracker } from '../../utils/performance-tracker';
 
 interface CameraControls {
   setCameraFollowing: (enabled: boolean) => void;
@@ -36,12 +37,14 @@ const VoxelCanvas: React.FC<VoxelCanvasProps> = ({
   useEffect(() => {
     // Initialize Three.js scene, camera, renderer, and controls
     if (canvasRef.current && !threeManagerRef.current) {
+      console.log('VoxelCanvas: Initializing ThreeManager');
       threeManagerRef.current = new ThreeManager(canvasRef.current);
     }
     
     return () => {
       // Cleanup Three.js objects
       if (threeManagerRef.current) {
+        console.log('VoxelCanvas: Disposing ThreeManager');
         threeManagerRef.current.dispose();
         threeManagerRef.current = null;
       }
@@ -51,7 +54,9 @@ const VoxelCanvas: React.FC<VoxelCanvasProps> = ({
   useEffect(() => {
     // Update Three.js scene when voxels change
     if (threeManagerRef.current) {
+      const startTime = performance.now();
       threeManagerRef.current.updateVoxels(voxels);
+      perfTracker.record('VoxelCanvas.updateVoxels', performance.now() - startTime);
     }
   }, [voxels]);
 
