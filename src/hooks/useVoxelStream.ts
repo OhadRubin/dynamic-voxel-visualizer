@@ -237,8 +237,8 @@ export const useVoxelStream = (websocketUrl: string) => {
     const interval = setInterval(() => {
       if (voxelUpdateQueue.current.size === 0) return;
 
-      const updates = new Map(voxelUpdateQueue.current);
-      voxelUpdateQueue.current.clear();
+      const updates = voxelUpdateQueue.current;
+      voxelUpdateQueue.current = new Map();
 
       setVoxels(prev => {
         const newVoxels = new Map(prev);

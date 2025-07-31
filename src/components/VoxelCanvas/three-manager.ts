@@ -4,17 +4,17 @@ import { VoxelData, VoxelState } from '../../hooks/useVoxelStream';
 import { perfTracker } from '../../utils/performance-tracker';
 
 const CHUNK_SIZE = 16;
-const MAX_VOXELS = 50000; // Increased capacity
+const MAX_VOXELS_PER_CHUNK = CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE;
 
 // LOD (Level of Detail) system
 enum LODLevel {
-  HIGH = 0,    // Full detail voxels
-  MEDIUM = 1,  // Simplified voxels
-  LOW = 2,     // Point sprites
-  CULLED = 3   // Not rendered
+  HIGH = 0,
+  MEDIUM = 1,
+  LOW = 2,
+  CULLED = 3,
 }
 
-const LOD_DISTANCES = [150, 400, 1000]; // Adjusted distances for better distribution
+const LOD_DISTANCES = [150, 400, 1000];
 
 // Voxel state colors
 const STATE_COLORS: Record<VoxelState, THREE.Color> = {
@@ -31,6 +31,254 @@ interface VoxelInstance {
   state: VoxelState;
   lodLevel: LODLevel;
   instanceIndex: number;
+  position: THREE.Vector3;
+}
+
+class Chunk {
+  public voxels: Map<string, VoxelInstance> = new Map(); // Voxel's world key -> VoxelInstance
+  private needsUpdate: Set<LODLevel> = new Set();
+
+  private scene: THREE.Scene;
+  private chunkPosition: THREE.Vector3;
+
+  public meshes: {
+    [LODLevel.HIGH]: THREE.InstancedMesh;
+    [LODLevel.MEDIUM]: THREE.InstancedMesh;
+    [LODLevel.LOW]: THREE.Points;
+  };
+  private availableIndices: Record<
+    LODLevel.HIGH | LODLevel.MEDIUM | LODLevel.LOW,
+    number[]
+  >;
+  private usedIndices: Record<
+    LODLevel.HIGH | LODLevel.MEDIUM | LODLevel.LOW,
+    Set<number>
+  >;
+
+  constructor(chunkKey: string, scene: THREE.Scene, private requestRender: () => void) {
+    this.scene = scene;
+    const [chunkX, chunkY, chunkZ] = chunkKey.split(',').map(Number);
+    this.chunkPosition = new THREE.Vector3(
+      chunkX * CHUNK_SIZE,
+      chunkY * CHUNK_SIZE,
+      chunkZ * CHUNK_SIZE
+    );
+
+    this.meshes = this.createMeshes();
+    this.availableIndices = {
+      [LODLevel.HIGH]: [],
+      [LODLevel.MEDIUM]: [],
+      [LODLevel.LOW]: [],
+    };
+    this.usedIndices = {
+      [LODLevel.HIGH]: new Set(),
+      [LODLevel.MEDIUM]: new Set(),
+      [LODLevel.LOW]: new Set(),
+    };
+    this.initializeAvailableIndices();
+  }
+
+  private createMeshes() {
+    const highGeom = new THREE.BoxGeometry(1, 1, 1);
+    const highMat = new THREE.MeshLambertMaterial();
+    const highMesh = new THREE.InstancedMesh(
+      highGeom,
+      highMat,
+      MAX_VOXELS_PER_CHUNK
+    );
+    highMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    if (highMesh.instanceColor)
+      highMesh.instanceColor.setUsage(THREE.DynamicDrawUsage);
+    highMesh.position.copy(this.chunkPosition);
+    this.scene.add(highMesh);
+
+    const medGeom = new THREE.BoxGeometry(0.7, 0.7, 0.7);
+    const medMat = new THREE.MeshLambertMaterial();
+    const medMesh = new THREE.InstancedMesh(
+      medGeom,
+      medMat,
+      MAX_VOXELS_PER_CHUNK
+    );
+    medMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    if (medMesh.instanceColor)
+      medMesh.instanceColor.setUsage(THREE.DynamicDrawUsage);
+    medMesh.position.copy(this.chunkPosition);
+    this.scene.add(medMesh);
+
+    const lowGeom = new THREE.BufferGeometry();
+    lowGeom.setAttribute(
+      'position',
+      new THREE.BufferAttribute(new Float32Array(MAX_VOXELS_PER_CHUNK * 3), 3)
+    );
+    lowGeom.setAttribute(
+      'color',
+      new THREE.BufferAttribute(new Float32Array(MAX_VOXELS_PER_CHUNK * 3), 3)
+    );
+    const lowMat = new THREE.PointsMaterial({ size: 3, vertexColors: true });
+    const lowPoints = new THREE.Points(lowGeom, lowMat);
+    lowPoints.position.copy(this.chunkPosition);
+    this.scene.add(lowPoints);
+
+    return {
+      [LODLevel.HIGH]: highMesh,
+      [LODLevel.MEDIUM]: medMesh,
+      [LODLevel.LOW]: lowPoints,
+    };
+  }
+
+  private initializeAvailableIndices() {
+    for (let i = 0; i < MAX_VOXELS_PER_CHUNK; i++) {
+      this.availableIndices[LODLevel.HIGH].push(i);
+      this.availableIndices[LODLevel.MEDIUM].push(i);
+      this.availableIndices[LODLevel.LOW].push(i);
+    }
+  }
+
+  private getLocalCoords(worldX: number, worldY: number, worldZ: number) {
+    return new THREE.Vector3(
+      worldX - this.chunkPosition.x,
+      worldY - this.chunkPosition.y,
+      worldZ - this.chunkPosition.z
+    );
+  }
+
+  public addVoxel(worldX: number, worldY: number, worldZ: number, state: VoxelState) {
+    const key = `${worldX},${worldY},${worldZ}`;
+    if (this.voxels.has(key)) {
+      this.updateVoxel(worldX, worldY, worldZ, state);
+      return;
+    }
+    const voxel: VoxelInstance = {
+      key,
+      state,
+      lodLevel: LODLevel.CULLED,
+      instanceIndex: -1,
+      position: new THREE.Vector3(worldX, worldY, worldZ),
+    };
+    this.voxels.set(key, voxel);
+  }
+
+  public removeVoxel(key: string) {
+    const voxel = this.voxels.get(key);
+    if (voxel) {
+      if (voxel.lodLevel !== LODLevel.CULLED) {
+        this.changeVoxelLOD(voxel, LODLevel.CULLED);
+      }
+      this.voxels.delete(key);
+    }
+  }
+
+  public updateVoxel(worldX: number, worldY: number, worldZ: number, state: VoxelState) {
+    const key = `${worldX},${worldY},${worldZ}`;
+    const voxel = this.voxels.get(key);
+    if (!voxel || voxel.state === state) return;
+
+    voxel.state = state;
+    if (voxel.lodLevel !== LODLevel.CULLED) {
+      const color = STATE_COLORS[state];
+      const mesh = this.meshes[voxel.lodLevel];
+      if (mesh instanceof THREE.InstancedMesh) {
+        mesh.setColorAt(voxel.instanceIndex, color);
+        if (mesh.instanceColor) this.needsUpdate.add(voxel.lodLevel);
+      } else {
+        const colors = mesh.geometry.getAttribute('color') as THREE.BufferAttribute;
+        colors.setXYZ(voxel.instanceIndex, color.r, color.g, color.b);
+        this.needsUpdate.add(LODLevel.LOW);
+      }
+    }
+  }
+
+  public updateVoxelLOD(voxel: VoxelInstance, cameraPosition: THREE.Vector3) {
+    const distance = voxel.position.distanceTo(cameraPosition);
+    let newLodLevel = LODLevel.CULLED;
+    if (distance < LOD_DISTANCES[0]) newLodLevel = LODLevel.HIGH;
+    else if (distance < LOD_DISTANCES[1]) newLodLevel = LODLevel.MEDIUM;
+    else if (distance < LOD_DISTANCES[2]) newLodLevel = LODLevel.LOW;
+
+    if (newLodLevel !== voxel.lodLevel) {
+      this.changeVoxelLOD(voxel, newLodLevel);
+      this.requestRender();
+    }
+  }
+
+  private changeVoxelLOD(voxel: VoxelInstance, newLodLevel: LODLevel) {
+    const oldLodLevel = voxel.lodLevel;
+
+    // Release from old LOD
+    if (oldLodLevel !== LODLevel.CULLED) {
+      const oldMesh = this.meshes[oldLodLevel];
+      this.availableIndices[oldLodLevel].push(voxel.instanceIndex);
+      this.usedIndices[oldLodLevel].delete(voxel.instanceIndex);
+      this.needsUpdate.add(oldLodLevel);
+
+      if (oldMesh instanceof THREE.InstancedMesh) {
+        // Move instance far away instead of scaling to zero
+        const matrix = new THREE.Matrix4().setPosition(-10000, -10000, -10000);
+        oldMesh.setMatrixAt(voxel.instanceIndex, matrix);
+      } else {
+        const positions = oldMesh.geometry.getAttribute('position') as THREE.BufferAttribute;
+        positions.setXYZ(voxel.instanceIndex, -10000, -10000, -10000);
+      }
+    }
+
+    voxel.lodLevel = newLodLevel;
+
+    // Acquire for new LOD
+    if (newLodLevel !== LODLevel.CULLED) {
+      const newIndex = this.availableIndices[newLodLevel].pop();
+      if (newIndex === undefined) {
+        voxel.lodLevel = LODLevel.CULLED;
+        return;
+      }
+
+      voxel.instanceIndex = newIndex;
+      this.usedIndices[newLodLevel].add(newIndex);
+      const newMesh = this.meshes[newLodLevel];
+      const color = STATE_COLORS[voxel.state];
+      const localPosition = this.getLocalCoords(voxel.position.x, voxel.position.y, voxel.position.z);
+      this.needsUpdate.add(newLodLevel);
+
+      if (newMesh instanceof THREE.InstancedMesh) {
+        const matrix = new THREE.Matrix4().setPosition(localPosition);
+        newMesh.setMatrixAt(newIndex, matrix);
+        newMesh.setColorAt(newIndex, color);
+      } else {
+        const positions = newMesh.geometry.getAttribute('position') as THREE.BufferAttribute;
+        const colors = newMesh.geometry.getAttribute('color') as THREE.BufferAttribute;
+        positions.setXYZ(newIndex, localPosition.x, localPosition.y, localPosition.z);
+        colors.setXYZ(newIndex, color.r, color.g, color.b);
+      }
+    }
+  }
+
+  public updateMeshes() {
+    this.needsUpdate.forEach(lodLevel => {
+      if (lodLevel === LODLevel.CULLED) return;
+      const mesh = this.meshes[lodLevel];
+      if (mesh instanceof THREE.InstancedMesh) {
+        // Set count to the highest used index + 1, or 0 if no indices are used
+        const maxUsedIndex = this.usedIndices[lodLevel].size > 0 ? Math.max(...Array.from(this.usedIndices[lodLevel])) : -1;
+        mesh.count = Math.max(0, maxUsedIndex + 1);
+        mesh.instanceMatrix.needsUpdate = true;
+        if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+      } else {
+        const positions = mesh.geometry.getAttribute('position') as THREE.BufferAttribute;
+        const colors = mesh.geometry.getAttribute('color') as THREE.BufferAttribute;
+        positions.needsUpdate = true;
+        colors.needsUpdate = true;
+        mesh.geometry.computeBoundingSphere();
+      }
+    });
+    this.needsUpdate.clear();
+  }
+
+  public dispose() {
+    Object.values(this.meshes).forEach(mesh => {
+      this.scene.remove(mesh);
+      mesh.geometry.dispose();
+      (mesh.material as THREE.Material).dispose();
+    });
+  }
 }
 
 export class ThreeManager {
@@ -39,335 +287,54 @@ export class ThreeManager {
   private renderer: THREE.WebGLRenderer;
   private controls!: OrbitControls;
 
-  // Optimized rendering objects
-  private instancedMeshes: Record<LODLevel, THREE.InstancedMesh | THREE.Points>;
-  private availableIndices: Record<LODLevel, number[]> = {
-    [LODLevel.HIGH]: [],
-    [LODLevel.MEDIUM]: [],
-    [LODLevel.LOW]: [],
-    [LODLevel.CULLED]: [],
-  };
-  private nextInstanceIndex: Record<LODLevel, number> = { [LODLevel.HIGH]: 0, [LODLevel.MEDIUM]: 0, [LODLevel.LOW]: 0, [LODLevel.CULLED]: 0 };
-  private dirtyBuffers: Set<LODLevel> = new Set();
-
-  private voxelInstances: Map<string, VoxelInstance> = new Map();
+  private chunks: Map<string, Chunk> = new Map();
+  private allVoxels: Map<string, { chunkKey: string }> = new Map();
 
   private currentPositionKey: string | null = null;
+  private currentTargetKey: string | null = null;
   private animationId: number | null = null;
   
   // Camera following variables
   private cameraFollowTarget: THREE.Vector3 = new THREE.Vector3();
+  private currentTargetPosition: THREE.Vector3 = new THREE.Vector3();
   private isFollowingEnabled: boolean = true;
   private followLerpFactor: number = 0.05;
+  private yawLerpFactor: number = 0.02; // Slower rotation for smooth yaw alignment
   private cameraOffset: THREE.Vector3 = new THREE.Vector3(30, 30, 30);
   private defaultCameraOffset: THREE.Vector3 = new THREE.Vector3(30, 30, 30);
   private userControlledCamera: boolean = false;
-  
-  // Culling variables
-  private cullingEnabled: boolean = false;
-  private cullingDistance: number = 100;
+  private targetYaw: number = 0; // Target yaw angle in radians
+  private currentYaw: number = 0; // Current yaw angle in radians
 
-  constructor(canvas: HTMLCanvasElement) {
-    this.scene = new THREE.Scene();
-    this.camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 2000);
-    this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
-
-    this.instancedMeshes = this.createInstancedMeshes();
-    this.initializeAvailableIndices();
-
-    this.initializeScene();
-    this.setupControls();
-    
-    this.startRenderLoop();
-  }
-
-  private createInstancedMeshes(): Record<LODLevel, THREE.InstancedMesh | THREE.Points> {
-    const geometries = {
-      [LODLevel.HIGH]: new THREE.BoxGeometry(1, 1, 1),
-      [LODLevel.MEDIUM]: new THREE.BoxGeometry(0.7, 0.7, 0.7),
-      [LODLevel.LOW]: new THREE.BufferGeometry(),
-    };
-
-    // Add color attributes
-    geometries[LODLevel.HIGH].setAttribute('color', new THREE.InstancedBufferAttribute(new Float32Array(MAX_VOXELS * 3), 3));
-    geometries[LODLevel.MEDIUM].setAttribute('color', new THREE.InstancedBufferAttribute(new Float32Array(MAX_VOXELS * 3), 3));
-    geometries[LODLevel.LOW].setAttribute('position', new THREE.BufferAttribute(new Float32Array(MAX_VOXELS * 3), 3));
-    geometries[LODLevel.LOW].setAttribute('color', new THREE.BufferAttribute(new Float32Array(MAX_VOXELS * 3), 3));
-
-    const materials = {
-      [LODLevel.HIGH]: new THREE.MeshLambertMaterial(),
-      [LODLevel.MEDIUM]: new THREE.MeshLambertMaterial(),
-      [LODLevel.LOW]: new THREE.PointsMaterial({ vertexColors: true, size: 3 }),
-    };
-
-    const meshes: any = {};
-
-    meshes[LODLevel.HIGH] = new THREE.InstancedMesh(geometries[LODLevel.HIGH], materials[LODLevel.HIGH], MAX_VOXELS);
-    meshes[LODLevel.MEDIUM] = new THREE.InstancedMesh(geometries[LODLevel.MEDIUM], materials[LODLevel.MEDIUM], MAX_VOXELS);
-    meshes[LODLevel.LOW] = new THREE.Points(geometries[LODLevel.LOW], materials[LODLevel.LOW]);
-
-    Object.values(meshes).forEach((mesh: any) => {
-        if (mesh.instanceMatrix) {
-            mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-        }
-        this.scene.add(mesh);
-    });
-
-    return meshes;
-  }
-
-  private initializeAvailableIndices() {
-      for (let i = 0; i < MAX_VOXELS; i++) {
-          this.availableIndices[LODLevel.HIGH].push(i);
-          this.availableIndices[LODLevel.MEDIUM].push(i);
-          this.availableIndices[LODLevel.LOW].push(i);
-      }
-  }
-
-  private getChunkCoords(x: number, y: number, z: number): [number, number, number] {
-    return [
-      Math.floor(x / CHUNK_SIZE),
-      Math.floor(y / CHUNK_SIZE),
-      Math.floor(z / CHUNK_SIZE)
-    ];
-  }
-
-  private getChunkKey(chunkX: number, chunkY: number, chunkZ: number): string {
-    return `${chunkX},${chunkY},${chunkZ}`;
-  }
-
-  private getLocalCoords(x: number, y: number, z: number): [number, number, number] {
-    return [
-      ((x % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE,
-      ((y % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE,
-      ((z % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE
-    ];
-  }
-
-  private getAvailableInstanceIndex(lodLevel: LODLevel): number | undefined {
-    return this.availableIndices[lodLevel].pop();
-  }
-
-  private releaseInstanceIndex(lodLevel: LODLevel, index: number): void {
-    this.availableIndices[lodLevel].push(index);
-    // Hide the instance
-    this.setInstanceTransform(lodLevel, index, new THREE.Vector3(0, -10000, 0), 'UNKNOWN');
-  }
-
-  private setInstanceTransform(lodLevel: LODLevel, index: number, position: THREE.Vector3, state: VoxelState): void {
-    const color = STATE_COLORS[state];
-    if (lodLevel === LODLevel.LOW) {
-        const points = this.instancedMeshes[LODLevel.LOW] as THREE.Points;
-        const positions = points.geometry.attributes.position as THREE.BufferAttribute;
-        const colors = points.geometry.attributes.color as THREE.BufferAttribute;
-        positions.setXYZ(index, position.x, position.y, position.z);
-        colors.setXYZ(index, color.r, color.g, color.b);
-        positions.needsUpdate = true;
-        colors.needsUpdate = true;
-    } else {
-        const mesh = this.instancedMeshes[lodLevel] as THREE.InstancedMesh;
-        const matrix = new THREE.Matrix4();
-        matrix.setPosition(position);
-        mesh.setMatrixAt(index, matrix);
-        mesh.setColorAt(index, color);
-        mesh.instanceMatrix.needsUpdate = true;
-        if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
-    }
-    this.dirtyBuffers.add(lodLevel);
-  }
-
-  public setCullingEnabled(enabled: boolean): void {
-    this.cullingEnabled = enabled;
-  }
-
-  public setCullingDistance(distance: number): void {
-    this.cullingDistance = Math.max(10, distance); // Minimum distance of 10
-  }
-
-  public getCullingSettings(): { enabled: boolean; distance: number } {
-    return {
-      enabled: this.cullingEnabled,
-      distance: this.cullingDistance
-    };
-  }
-
-  public getCameraSettings(): { following: boolean; userControlled: boolean } {
-    return {
-      following: this.isFollowingEnabled,
-      userControlled: this.userControlledCamera
-    };
-  }
-
-  public setCameraFollowing(enabled: boolean): void {
-    this.isFollowingEnabled = enabled;
-    if (enabled) {
-      this.userControlledCamera = false;
-    }
-  }
-
-  public resetCameraToDefault(): void {
-    this.isFollowingEnabled = true;
-    this.userControlledCamera = false;
-    this.cameraOffset.copy(this.defaultCameraOffset);
-    
-    if (this.currentPositionKey) {
-        const targetPosition = this.cameraFollowTarget;
-        const desiredPosition = targetPosition.clone().add(this.cameraOffset);
-        this.camera.position.copy(desiredPosition);
-        this.controls.target.copy(targetPosition);
-        this.controls.update();
-        this.requestRender();
-    }
-  }
-
-  private isAutomaticallyMovingCamera: boolean = false;
+  private lodUpdateInterval: number | null = null;
   private needsRender: boolean = true;
   private isUserInteracting: boolean = false;
 
-  private voxelUpdateQueue: Array<{key: string, voxelData: VoxelData | null}> = [];
-  private queuedKeys = new Set<string>();
-  private isProcessingBatch: boolean = false;
-  private readonly BATCH_SIZE = 500; // Increased batch size
-  private readonly FRAME_BUDGET_MS = 16;
-  
-  private frameCount = 0;
-  private lastPerformanceLog = 0;
+  constructor(canvas: HTMLCanvasElement) {
+    this.scene = new THREE.Scene();
+    this.camera = new THREE.PerspectiveCamera(
+      75,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      2000
+    );
+    this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
 
-  private requestRender(): void {
-    this.needsRender = true;
+    this.initializeScene();
+    this.setupControls();
+
+    this.startRenderLoop();
+    this.lodUpdateInterval = window.setInterval(this.updateLODs, 500);
   }
 
-  private calculateLODLevel(voxelData: VoxelData): LODLevel {
-    if (voxelData.state === 'CURRENT_POSITION' || voxelData.state === 'CURRENT_TARGET') {
-      return LODLevel.HIGH;
-    }
-
-    const distance = this.camera.position.distanceTo(new THREE.Vector3(voxelData.x, voxelData.y, voxelData.z));
-    
-    if (distance < LOD_DISTANCES[0]) return LODLevel.HIGH;
-    if (distance < LOD_DISTANCES[1]) return LODLevel.MEDIUM;
-    if (distance < LOD_DISTANCES[2]) return LODLevel.LOW;
-    return LODLevel.CULLED;
+  private getChunkKey(x: number, y: number, z: number): string {
+    const chunkX = Math.floor(x / CHUNK_SIZE);
+    const chunkY = Math.floor(y / CHUNK_SIZE);
+    const chunkZ = Math.floor(z / CHUNK_SIZE);
+    return `${chunkX},${chunkY},${chunkZ}`;
   }
 
-  private logPerformance(): void {
-    this.frameCount++;
-    const now = performance.now();
-    
-    if (now - this.lastPerformanceLog > 10000) { // Every 10 seconds
-      const totalVoxels = this.voxelInstances.size;
-      const queueSize = this.voxelUpdateQueue.length;
-      
-      console.log(`Performance: ${totalVoxels} voxels, ${queueSize} queued, ~${(this.frameCount / 10).toFixed(1)} fps`);
-      
-      this.frameCount = 0;
-      this.lastPerformanceLog = now;
-    }
-  }
-
-  private addToQueue(key: string, voxelData: VoxelData | null): void {
-    if (this.queuedKeys.has(key)) {
-      const existingIndex = this.voxelUpdateQueue.findIndex(item => item.key === key);
-      if (existingIndex !== -1) {
-        this.voxelUpdateQueue[existingIndex] = { key, voxelData };
-      }
-      return;
-    }
-
-    this.voxelUpdateQueue.push({ key, voxelData });
-    this.queuedKeys.add(key);
-  }
-
-  private processBatchedVoxelUpdates(): void {
-    if (this.voxelUpdateQueue.length === 0 || this.isProcessingBatch) {
-      return;
-    }
-
-    this.isProcessingBatch = true;
-    const startTime = performance.now();
-    let processedCount = 0;
-
-    while (this.voxelUpdateQueue.length > 0 && (performance.now() - startTime) < this.FRAME_BUDGET_MS) {
-        const update = this.voxelUpdateQueue.shift()!;
-        this.queuedKeys.delete(update.key);
-        this.processVoxelUpdate(update.key, update.voxelData);
-        processedCount++;
-        if (processedCount >= this.BATCH_SIZE) break;
-    }
-
-    if (processedCount > 0) {
-      this.requestRender();
-    }
-
-    this.isProcessingBatch = false;
-  }
-
-  private processVoxelUpdate(key: string, voxelData: VoxelData | null): void {
-    const existingInstance = this.voxelInstances.get(key);
-
-    if (voxelData === null) { // Removal
-      if (existingInstance) {
-        this.releaseInstanceIndex(existingInstance.lodLevel, existingInstance.instanceIndex);
-        this.voxelInstances.delete(key);
-      }
-      return;
-    }
-
-    const lodLevel = this.calculateLODLevel(voxelData);
-    const position = new THREE.Vector3(voxelData.x, voxelData.y, voxelData.z);
-
-    if (existingInstance) { // Update
-      if (existingInstance.lodLevel !== lodLevel) {
-        this.releaseInstanceIndex(existingInstance.lodLevel, existingInstance.instanceIndex);
-        const newInstanceIndex = this.getAvailableInstanceIndex(lodLevel);
-        if (newInstanceIndex !== undefined) {
-          this.setInstanceTransform(lodLevel, newInstanceIndex, position, voxelData.state);
-          existingInstance.lodLevel = lodLevel;
-          existingInstance.instanceIndex = newInstanceIndex;
-          existingInstance.state = voxelData.state;
-        } else {
-            this.voxelInstances.delete(key); // No space left
-        }
-      } else {
-        this.setInstanceTransform(lodLevel, existingInstance.instanceIndex, position, voxelData.state);
-        existingInstance.state = voxelData.state;
-      }
-    } else { // Addition
-      if (lodLevel === LODLevel.CULLED) return;
-      const newInstanceIndex = this.getAvailableInstanceIndex(lodLevel);
-      if (newInstanceIndex !== undefined) {
-        this.setInstanceTransform(lodLevel, newInstanceIndex, position, voxelData.state);
-        this.voxelInstances.set(key, { key, state: voxelData.state, lodLevel, instanceIndex: newInstanceIndex });
-      }
-    }
-
-    if (voxelData.state === 'CURRENT_POSITION') {
-      this.currentPositionKey = key;
-      if (this.isFollowingEnabled) {
-        this.cameraFollowTarget.copy(position);
-      }
-    }
-  }
-
-  private updateDirtyBuffers() {
-      this.dirtyBuffers.forEach(lodLevel => {
-          const mesh = this.instancedMeshes[lodLevel];
-          if ((mesh as THREE.InstancedMesh).isInstancedMesh) {
-              const instancedMesh = mesh as THREE.InstancedMesh;
-              instancedMesh.instanceMatrix.needsUpdate = true;
-              if (instancedMesh.instanceColor) {
-                  instancedMesh.instanceColor.needsUpdate = true;
-              }
-          } else if ((mesh as THREE.Points).isPoints) {
-              const points = mesh as THREE.Points;
-              points.geometry.attributes.position.needsUpdate = true;
-              points.geometry.attributes.color.needsUpdate = true;
-          }
-      });
-      this.dirtyBuffers.clear();
-  }
-
-  private initializeScene(): void {
+  private initializeScene() {
     this.renderer.setSize(window.innerWidth, window.innerHeight);
     this.renderer.setPixelRatio(window.devicePixelRatio);
     this.scene.background = new THREE.Color(0x0a0a0a);
@@ -386,7 +353,7 @@ export class ThreeManager {
     this.scene.add(axesHelper);
   }
 
-  private setupControls(): void {
+  private setupControls() {
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
     this.controls.enableDamping = true;
     this.controls.dampingFactor = 0.05;
@@ -405,6 +372,10 @@ export class ThreeManager {
     window.addEventListener('resize', this.onWindowResize.bind(this));
   }
 
+  private requestRender(): void {
+    this.needsRender = true;
+  }
+
   private handleDoubleClick = (event: MouseEvent) => {
     const mouse = new THREE.Vector2();
     const rect = this.renderer.domElement.getBoundingClientRect();
@@ -414,14 +385,23 @@ export class ThreeManager {
     const raycaster = new THREE.Raycaster();
     raycaster.setFromCamera(mouse, this.camera);
 
-    const intersects = raycaster.intersectObjects(Object.values(this.instancedMeshes));
+    const chunkMeshes: THREE.Object3D[] = [];
+    this.chunks.forEach(chunk => {
+      Object.values(chunk.meshes).forEach(mesh => {
+        chunkMeshes.push(mesh as THREE.Object3D);
+      });
+    });
+    const intersects = raycaster.intersectObjects(chunkMeshes);
 
     if (intersects.length > 0) {
       const intersect = intersects[0];
       if (intersect.instanceId !== undefined) {
         const instanceMatrix = new THREE.Matrix4();
         (intersect.object as THREE.InstancedMesh).getMatrixAt(intersect.instanceId, instanceMatrix);
+        
         const position = new THREE.Vector3().setFromMatrixPosition(instanceMatrix);
+        // The position is local to the chunk, we need to transform it to world coordinates
+        position.applyMatrix4(intersect.object.matrixWorld);
         
         this.controls.target.copy(position);
         this.controls.update();
@@ -431,6 +411,12 @@ export class ThreeManager {
     }
   };
 
+  private onWindowResize(): void {
+    this.camera.aspect = window.innerWidth / window.innerHeight;
+    this.camera.updateProjectionMatrix();
+    this.renderer.setSize(window.innerWidth, window.innerHeight);
+    this.requestRender();
+  }
 
   private startRenderLoop(): void {
     const animate = () => {
@@ -439,15 +425,32 @@ export class ThreeManager {
       const loopStartTime = performance.now();
       let shouldRender = this.needsRender;
       
-      const batchStartTime = performance.now();
-      this.processBatchedVoxelUpdates();
-      perfTracker.record('processBatchedVoxelUpdates', performance.now() - batchStartTime);
+      this.chunks.forEach(chunk => chunk.updateMeshes());
 
-      if (this.isFollowingEnabled && this.currentPositionKey && !this.userControlledCamera) {
-        const desiredPosition = new THREE.Vector3().copy(this.cameraFollowTarget).add(this.cameraOffset);
+      if (this.isFollowingEnabled && this.currentPositionKey) {
+        // Smooth yaw rotation towards target direction
+        let yawChanged = false;
+        if (this.currentTargetKey) {
+          const yawDiff = this.targetYaw - this.currentYaw;
+          // Handle angle wrapping (shortest rotation path)
+          let adjustedYawDiff = yawDiff;
+          if (adjustedYawDiff > Math.PI) adjustedYawDiff -= 2 * Math.PI;
+          if (adjustedYawDiff < -Math.PI) adjustedYawDiff += 2 * Math.PI;
+          
+          if (Math.abs(adjustedYawDiff) > 0.01) {
+            this.currentYaw += adjustedYawDiff * this.yawLerpFactor;
+            yawChanged = true;
+          }
+        }
+
+        // Apply yaw rotation to camera offset
+        const rotatedOffset = this.cameraOffset.clone();
+        rotatedOffset.applyAxisAngle(new THREE.Vector3(0, 1, 0), this.currentYaw);
+
+        const desiredPosition = new THREE.Vector3().copy(this.cameraFollowTarget).add(rotatedOffset);
         const delta = new THREE.Vector3().subVectors(desiredPosition, this.camera.position).multiplyScalar(this.followLerpFactor);
         
-        if (delta.length() > 0.001) {
+        if (delta.length() > 0.001 || yawChanged) {
           this.camera.position.add(delta);
           const targetDelta = new THREE.Vector3().subVectors(this.cameraFollowTarget, this.controls.target).multiplyScalar(this.followLerpFactor);
           this.controls.target.add(targetDelta);
@@ -455,10 +458,7 @@ export class ThreeManager {
         }
       }
       
-      this.logPerformance();
-      
-      if (shouldRender || this.isUserInteracting || this.dirtyBuffers.size > 0) {
-        this.updateDirtyBuffers();
+      if (shouldRender || this.isUserInteracting) {
         const renderStartTime = performance.now();
         this.controls.update();
         this.renderer.render(this.scene, this.camera);
@@ -472,75 +472,203 @@ export class ThreeManager {
     animate();
   }
 
-  public updateVoxels(voxelsMap: Map<string, VoxelData>): void {
-    const newKeys = new Set(voxelsMap.keys());
+  private updateLODs = () => {
+    if (this.isUserInteracting) return;
+    const startTime = performance.now();
+    const cameraPosition = this.camera.position;
+    this.chunks.forEach(chunk => {
+      chunk.voxels.forEach(voxel => {
+        chunk.updateVoxelLOD(voxel, cameraPosition);
+      });
+    });
+    perfTracker.record('updateLODs', performance.now() - startTime);
+  };
 
-    // Single pass for additions, updates, and removals
-    const allKeys = new Set([...Array.from(newKeys), ...Array.from(this.voxelInstances.keys())]);
+  public updateVoxels(voxelsMap: Map<string, VoxelData>) {
+    const startTime = performance.now();
+    const newVoxelKeys = new Set(voxelsMap.keys());
 
-    allKeys.forEach(key => {
-        const newVoxelData = voxelsMap.get(key) || null;
-        this.addToQueue(key, newVoxelData);
+    // Remove voxels that are no longer in the stream
+    this.allVoxels.forEach((info, key) => {
+      if (!newVoxelKeys.has(key)) {
+        const chunk = this.chunks.get(info.chunkKey);
+        chunk?.removeVoxel(key);
+        this.allVoxels.delete(key);
+      }
     });
 
+    // Add or update voxels
+    voxelsMap.forEach((voxelData, voxelKey) => {
+      const { x, y, z, state } = voxelData;
+      const existingVoxel = this.allVoxels.get(voxelKey);
+      const chunkKey = this.getChunkKey(x, y, z);
+
+      let chunk = this.chunks.get(chunkKey);
+      if (!chunk) {
+        chunk = new Chunk(chunkKey, this.scene, () => this.requestRender());
+        this.chunks.set(chunkKey, chunk);
+      }
+
+      if (existingVoxel) {
+        chunk.updateVoxel(x, y, z, state);
+      } else {
+        chunk.addVoxel(x, y, z, state);
+        this.allVoxels.set(voxelKey, { chunkKey });
+      }
+
+      // Handle current position and target for camera following
+      if (state === 'CURRENT_POSITION') {
+        this.updateCurrentPosition(x, y, z);
+      } else if (state === 'CURRENT_TARGET') {
+        this.updateCurrentTarget(x, y, z);
+      }
+    });
+
+    // Initial LOD update for new voxels
+    this.updateLODs();
     this.requestRender();
+    perfTracker.record('updateVoxels', performance.now() - startTime);
   }
 
-  public centerCamera(bounds: { min: { x: number; y: number; z: number }; max: { x: number; y: number; z: number } }): void {
-    if (this.voxelInstances.size === 0) return;
+  public updateCurrentPosition(x: number, y: number, z: number) {
+    const newPositionKey = `${x},${y},${z}`;
+    if (newPositionKey === this.currentPositionKey) return;
 
+    this.currentPositionKey = newPositionKey;
+    if (this.isFollowingEnabled) {
+      this.cameraFollowTarget.set(x, y, z);
+      this.updateTargetYaw();
+      this.requestRender();
+    }
+  }
+
+  public updateCurrentTarget(x: number, y: number, z: number) {
+    const newTargetKey = `${x},${y},${z}`;
+    if (newTargetKey === this.currentTargetKey) return;
+
+    this.currentTargetKey = newTargetKey;
+    if (this.isFollowingEnabled) {
+      this.currentTargetPosition.set(x, y, z);
+      this.updateTargetYaw();
+      this.requestRender();
+    }
+  }
+
+  private updateTargetYaw() {
+    if (this.currentPositionKey && this.currentTargetKey && this.isFollowingEnabled) {
+      // Calculate direction from current position to target
+      const direction = new THREE.Vector3()
+        .subVectors(this.currentTargetPosition, this.cameraFollowTarget)
+        .normalize();
+      
+      // Calculate target yaw (rotation around Y-axis)
+      this.targetYaw = Math.atan2(direction.x, direction.z);
+    }
+  }
+
+  public resetCameraToDefault(): void {
+    this.isFollowingEnabled = true;
+    this.userControlledCamera = false;
+    this.cameraOffset.copy(this.defaultCameraOffset);
+    this.currentYaw = 0;
+    this.targetYaw = 0;
+    
+    if (this.currentPositionKey) {
+        const targetPosition = this.cameraFollowTarget;
+        const desiredPosition = targetPosition.clone().add(this.cameraOffset);
+        this.camera.position.copy(desiredPosition);
+        this.controls.target.copy(targetPosition);
+        this.controls.update();
+        this.requestRender();
+    }
+  }
+
+  public centerCamera(bounds: { min: { x: number; y: number; z: number }; max: { x: number; y: number; z: number } }) {
     const center = new THREE.Vector3(
-      (bounds.min.x + bounds.max.x) / 2,
-      (bounds.min.y + bounds.max.y) / 2,
-      (bounds.min.z + bounds.max.z) / 2
+        (bounds.min.x + bounds.max.x) / 2,
+        (bounds.min.y + bounds.max.y) / 2,
+        (bounds.min.z + bounds.max.z) / 2
     );
-
     const size = new THREE.Vector3(
-      bounds.max.x - bounds.min.x,
-      bounds.max.y - bounds.min.y,
-      bounds.max.z - bounds.min.z
+        bounds.max.x - bounds.min.x,
+        bounds.max.y - bounds.min.y,
+        bounds.max.z - bounds.min.z
     );
-
     const maxDim = Math.max(size.x, size.y, size.z);
-    const distance = maxDim * 1.5; // Adjust distance for better framing
+    const fov = this.camera.fov * (Math.PI / 180);
+    let cameraZ = Math.abs(maxDim / 2 * Math.tan(fov * 2));
+    cameraZ *= 1.5; // zoom out a bit
 
-    this.controls.target.copy(center);
-    this.camera.position.set(center.x + distance, center.y + distance, center.z + distance);
-    this.camera.lookAt(center);
-    this.controls.update();
-    this.requestRender();
+    this.camera.position.set(center.x, center.y, center.z + cameraZ);
+    this.controls.target.set(center.x, center.y, center.z);
+    this.userControlledCamera = false;
   }
 
+  public getCameraSettings(): { following: boolean; userControlled: boolean } {
+    return {
+      following: this.isFollowingEnabled,
+      userControlled: this.userControlledCamera
+    };
+  }
 
-  private onWindowResize(): void {
-    this.camera.aspect = window.innerWidth / window.innerHeight;
+  public setCameraFollowing(enabled: boolean): void {
+    this.isFollowingEnabled = enabled;
+    if (enabled) {
+      this.userControlledCamera = false;
+      // Reset yaw when enabling camera following
+      this.currentYaw = 0;
+      this.targetYaw = 0;
+      // If we have a current position, immediately start following it
+      if (this.currentPositionKey) {
+        const [x, y, z] = this.currentPositionKey.split(',').map(Number);
+        this.cameraFollowTarget.set(x, y, z);
+        this.updateTargetYaw();
+        this.requestRender();
+      }
+    }
+  }
+
+  public setCullingEnabled(_enabled: boolean): void {
+    // Culling is now implicitly handled by the LOD system
+  }
+
+  public setCullingDistance(_distance: number): void {
+    // This is now controlled by LOD_DISTANCES
+  }
+
+  public getCullingSettings(): { enabled: boolean; distance: number } {
+    return {
+      enabled: true, // Always enabled with LOD system
+      distance: LOD_DISTANCES[2] // Max LOD distance
+    };
+  }
+
+  public resize(width: number, height: number) {
+    this.camera.aspect = width / height;
     this.camera.updateProjectionMatrix();
-    this.renderer.setSize(window.innerWidth, window.innerHeight);
-    this.requestRender();
+    this.renderer.setSize(width, height);
+    this.needsRender = true;
   }
 
-  public dispose(): void {
+  public dispose() {
     if (this.animationId) {
       cancelAnimationFrame(this.animationId);
     }
-
-    this.voxelUpdateQueue.length = 0;
-    this.queuedKeys.clear();
+    if (this.lodUpdateInterval) {
+      clearInterval(this.lodUpdateInterval);
+    }
 
     this.renderer.domElement.removeEventListener('dblclick', this.handleDoubleClick.bind(this));
     window.removeEventListener('resize', this.onWindowResize.bind(this));
 
+    this.chunks.forEach(chunk => chunk.dispose());
+    this.chunks.clear();
+    this.allVoxels.clear();
+
     this.scene.children.forEach(child => {
         this.scene.remove(child);
-        if ((child as any).geometry) {
-            (child as any).geometry.dispose();
-        }
-        if ((child as any).material) {
-            (child as any).material.dispose();
-        }
     });
 
-    this.voxelInstances.clear();
     this.controls.dispose();
     this.renderer.dispose();
   }
