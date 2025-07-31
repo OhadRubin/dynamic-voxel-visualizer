@@ -35,6 +35,7 @@ export const useVoxelStream = (websocketUrl: string) => {
   });
   const [isPaused, setIsPaused] = useState(false);
   const [centerRequest, setCenterRequest] = useState(0);
+  const voxelUpdateQueue = useRef<Map<string, VoxelData>>(new Map());
   
   const websocket = useRef<WebSocket | null>(null);
   const uniquePositions = useRef<Set<string>>(new Set());
@@ -91,45 +92,10 @@ export const useVoxelStream = (websocketUrl: string) => {
             };
 
             const key = `${voxelData.x},${voxelData.y},${voxelData.z}`;
+            
+            // Add to the update queue
+            voxelUpdateQueue.current.set(key, voxelData);
 
-            setVoxels(prev => {
-              const newVoxels = new Map(prev);
-              newVoxels.set(key, voxelData);
-              return newVoxels;
-            });
-
-            uniquePositions.current.add(key);
-            voxelCount.current++;
-
-            // Update bounds
-            setStats(prev => ({
-              ...prev,
-              voxelCount: voxelCount.current,
-              uniqueCount: uniquePositions.current.size,
-              bounds: {
-                min: {
-                  x: Math.min(prev.bounds.min.x, voxelData.x),
-                  y: Math.min(prev.bounds.min.y, voxelData.y),
-                  z: Math.min(prev.bounds.min.z, voxelData.z)
-                },
-                max: {
-                  x: Math.max(prev.bounds.max.x, voxelData.x),
-                  y: Math.max(prev.bounds.max.y, voxelData.y),
-                  z: Math.max(prev.bounds.max.z, voxelData.z)
-                }
-              }
-            }));
-
-            // Track for rate calculation
-            const now = Date.now();
-            recentVoxels.current.push(now);
-            const fiveSecondsAgo = now - 5000;
-            recentVoxels.current = recentVoxels.current.filter(time => time > fiveSecondsAgo);
-
-            // Debug logging
-            // if (voxelCount.current < 10 || voxelCount.current % 1000 === 0) {
-            //   console.log(`Voxel ${voxelCount.current}: x=${voxelData.x}, y=${voxelData.y}, z=${voxelData.z}, state=${voxelData.state}`);
-            // }
           } else if (data.type === 'clear_target') {
             // Handle target clearing if needed
             console.log('TARGET_DEBUG: Clearing current target visualization');
@@ -262,6 +228,58 @@ export const useVoxelStream = (websocketUrl: string) => {
         rate: voxelsInLastSecond
       }));
     }, 100);
+
+    return () => clearInterval(interval);
+  }, []);
+
+  // Batch-process voxel updates
+  useEffect(() => {
+    const interval = setInterval(() => {
+      if (voxelUpdateQueue.current.size === 0) return;
+
+      const updates = new Map(voxelUpdateQueue.current);
+      voxelUpdateQueue.current.clear();
+
+      setVoxels(prev => {
+        const newVoxels = new Map(prev);
+        updates.forEach((value, key) => {
+          newVoxels.set(key, value);
+        });
+        return newVoxels;
+      });
+
+      updates.forEach(voxelData => {
+        const key = `${voxelData.x},${voxelData.y},${voxelData.z}`;
+        uniquePositions.current.add(key);
+        voxelCount.current++;
+
+        // Update bounds
+        setStats(prev => ({
+          ...prev,
+          voxelCount: voxelCount.current,
+          uniqueCount: uniquePositions.current.size,
+          bounds: {
+            min: {
+              x: Math.min(prev.bounds.min.x, voxelData.x),
+              y: Math.min(prev.bounds.min.y, voxelData.y),
+              z: Math.min(prev.bounds.min.z, voxelData.z)
+            },
+            max: {
+              x: Math.max(prev.bounds.max.x, voxelData.x),
+              y: Math.max(prev.bounds.max.y, voxelData.y),
+              z: Math.max(prev.bounds.max.z, voxelData.z)
+            }
+          }
+        }));
+
+        // Track for rate calculation
+        const now = Date.now();
+        recentVoxels.current.push(now);
+        const fiveSecondsAgo = now - 5000;
+        recentVoxels.current = recentVoxels.current.filter(time => time > fiveSecondsAgo);
+      });
+
+    }, 100); // Process queue every 100ms
 
     return () => clearInterval(interval);
   }, []);

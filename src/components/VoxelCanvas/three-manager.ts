@@ -475,16 +475,12 @@ export class ThreeManager {
   public updateVoxels(voxelsMap: Map<string, VoxelData>): void {
     const newKeys = new Set(voxelsMap.keys());
 
-    // Removals
-    this.voxelInstances.forEach((instance, key) => {
-        if (!newKeys.has(key)) {
-            this.addToQueue(key, null);
-        }
-    });
+    // Single pass for additions, updates, and removals
+    const allKeys = new Set([...Array.from(newKeys), ...Array.from(this.voxelInstances.keys())]);
 
-    // Additions/Updates
-    voxelsMap.forEach((voxelData, key) => {
-      this.addToQueue(key, voxelData);
+    allKeys.forEach(key => {
+        const newVoxelData = voxelsMap.get(key) || null;
+        this.addToQueue(key, newVoxelData);
     });
 
     this.requestRender();
