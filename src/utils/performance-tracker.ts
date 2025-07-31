@@ -29,9 +29,9 @@ class PerformanceTracker {
             .filter(Boolean);
 
         if (summary.length > 0) {
-            console.groupCollapsed(`--- Performance Summary (last 10s) ---`);
+            // console.groupCollapsed(`--- Performance Summary (last 10s) ---`);
             summary.forEach(line => console.log(line));
-            console.groupEnd();
+            // console.groupEnd();
         }
 
         // Reset timings

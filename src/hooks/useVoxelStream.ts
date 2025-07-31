@@ -127,9 +127,9 @@ export const useVoxelStream = (websocketUrl: string) => {
             recentVoxels.current = recentVoxels.current.filter(time => time > fiveSecondsAgo);
 
             // Debug logging
-            if (voxelCount.current < 10 || voxelCount.current % 1000 === 0) {
-              console.log(`Voxel ${voxelCount.current}: x=${voxelData.x}, y=${voxelData.y}, z=${voxelData.z}, state=${voxelData.state}`);
-            }
+            // if (voxelCount.current < 10 || voxelCount.current % 1000 === 0) {
+            //   console.log(`Voxel ${voxelCount.current}: x=${voxelData.x}, y=${voxelData.y}, z=${voxelData.z}, state=${voxelData.state}`);
+            // }
           } else if (data.type === 'clear_target') {
             // Handle target clearing if needed
             console.log('TARGET_DEBUG: Clearing current target visualization');
